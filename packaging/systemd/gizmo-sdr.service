@@ -1,0 +1,26 @@
+[Unit]
+Description=GIZMo software-defined-radio stream
+Requires=gizmo-hardware.service
+After=gizmo-hardware.service
+PartOf=gizmo.target
+
+[Service]
+Type=simple
+User=root
+Group=gizmo
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/etc/gizmo/runtime.env
+ExecStart=/usr/bin/python3 /usr/libexec/gizmo/gizmo_sdr.py
+Restart=on-failure
+RestartSec=2
+CapabilityBoundingSet=CAP_SYS_RAWIO
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=gizmo.target

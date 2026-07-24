@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+
+if [ -d /run/systemd/system ] && systemctl is-active --quiet gizmo.target; then
+    if [ "${1:-}" = upgrade ]; then
+        mkdir -p /run/gizmo
+        touch /run/gizmo/restart-after-upgrade
+    fi
+    systemctl stop gizmo.target
+fi

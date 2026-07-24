@@ -1,0 +1,32 @@
+[Unit]
+Description=GIZMo impedance monitor and TCP data service
+Requires=gizmo-hardware.service
+After=gizmo-hardware.service
+PartOf=gizmo.target
+
+[Service]
+Type=simple
+User=root
+Group=gizmo
+UMask=0002
+WorkingDirectory=/var/lib/gizmo
+EnvironmentFile=/etc/gizmo/runtime.env
+EnvironmentFile=-/var/lib/gizmo/ZMonArg1.env
+EnvironmentFile=-/var/lib/gizmo/ZMonArg2.env
+EnvironmentFile=-/var/lib/gizmo/ZMonArg3.env
+ExecStart=/usr/bin/gizmo-zmon ${ZMonArg1} ${ZMonArg2} ${ZMonArg3}
+Restart=always
+RestartSec=2
+TimeoutStopSec=10
+CapabilityBoundingSet=CAP_SYS_RAWIO
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/gizmo
+ProtectHome=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=gizmo.target

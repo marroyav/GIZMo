@@ -1,0 +1,13 @@
+# /etc/systemd/system/rc.startup.service
+[Unit]
+Description=Run rc.startup script at boot
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/etc/rc.startup
+RemainAfterExit=true
+
+[Install]
+WantedBy=multi-user.target
+

@@ -1,0 +1,2 @@
+# The overlay creates this bus dynamically. Restrict it to the package service account.
+SUBSYSTEM=="i2c-dev", KERNEL=="i2c-7", GROUP="gizmo", MODE="0660"

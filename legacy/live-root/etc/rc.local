@@ -1,0 +1,94 @@
+#!/bin/sh
+
+# Wait for the ethernet stack to be functional so data can be passed with sockets by the scripts
+while ! ip addr show lo | grep -q "inet "; do sleep 1; done
+
+# Wait for the done file to be created by the rc.startup script before continuing.
+# This is required to prevent acessing MMIO before the firmware instantiates it.
+while [ ! -f /dev/shm/rc.startup.done ]; do
+    sleep 1
+done
+
+#echo "rc.startup is done!"
+
+# Source the environment varialbes
+. /home/ubuntu/Software/ZMonArg1.env
+. /home/ubuntu/Software/ZMonArg2.env
+. /home/ubuntu/Software/ZMonArg3.env
+. /home/ubuntu/Software/setRunInterval.env
+. /home/ubuntu/Software/setThreshold.env
+
+# Deactivate any of the below scripts before re-running them. Re-direct output to a temporary log file
+/home/ubuntu/Software/Deactivate-Scripts.sh > /dev/shm/Deactivate-Scripts.log
+
+# Run the ZMon Calculation and pass arguments such as CAL 1 and run. Re-direct output to a temporary log file and push process to background
+#/home/ubuntu/Software/ZMon.12.16 "$ZMonArg1" "$ZMonArg2" "$ZMonArg3" > /dev/shm/ZMon.log &
+/home/ubuntu/Software/ZMon.12.16 "$ZMonArg1" "$ZMonArg2" "$ZMonArg3" > /dev/shm/ZMon.log 2>&1 &
+# zmqServer.py should update the environment variables when new commands are to be sent into the script
+
+# Run the Display. Re-direct stdout to a temporary log file and push process to background
+#/home/ubuntu/Software/EVE-main_Kria/EVE-main_Kria > /dev/shm/EVE.log &
+/home/ubuntu/Software/EVE-main_Kria/EVE-main_Kria > /dev/shm/EVE.log 2>&1 &
+
+# ZMQ Server for handling I/O commnads from a connected client device. Re-direct output to a temporary log file and push to background
+#sudo -u ubuntu python3 /home/ubuntu/Software/zmqServer.py > /dev/shm/zmqServer.log &
+# Search for a running instance of ZMQ
+PID=$(ps aux | grep 'zmq' | grep -v 'grep' | awk '{print $2}')
+if [ ! -z "$PID" ]; then
+    echo "ZMQ already running with PID $PID" > /dev/null
+else
+    #echo "zmq is not running. Starting it..."
+    #sudo -u ubuntu python3 /home/ubuntu/Software/zmqServer.py > /dev/shm/zmqServer.log &
+    sudo -u ubuntu python3 /home/ubuntu/Software/zmqServer.py > /dev/shm/zmqServer.log 2>&1 &
+fi
+
+# Temperature Monitoring Server for sending device temps to a connected client. This server is primarily used by the OPC-UA server which connects as a client to the temperature server.
+#python3 /home/ubuntu/Software/Temperature.MCP9808.py > /dev/shm/TemperatureServer.log &
+# Search for a running instance of OPC
+PID=$(ps aux | grep 'Temperature.MCP9808' | grep -v 'grep' | awk '{print $2}')
+if [ ! -z "$PID" ]; then
+    echo "Temperature already running with PID $PID" > /dev/null
+else
+    #echo "Temperature.MCP9808.py is not running. Starting it..."
+    #sudo -u ubuntu python3 /home/ubuntu/Software/Temperature.MCP9808.py > /dev/shm/TemperatureServer.log &
+    sudo -u ubuntu python3 /home/ubuntu/Software/Temperature.MCP9808.py > /dev/shm/TemperatureServer.log 2>&1 &
+fi
+
+# SDR Feature
+#python3 /home/ubuntu/Software/SDR2.py > /dev/shm/SDR2.log &
+# Search for a running instance of SDR
+PID=$(ps aux | grep 'SDR' | grep -v 'grep' | awk '{print $2}')
+if [ ! -z "$PID" ]; then
+    echo "Software Defined Radio already running with PID $PID" > /dev/null
+else
+    #echo "SDR2.py is not running. Starting it..."
+    #python3 /home/ubuntu/Software/SDR2.py > /dev/shm/SDR2.log &
+    python3 /home/ubuntu/Software/SDR2.py > /dev/shm/SDR2.log 2>&1 &
+fi
+
+# OPCUA Server for handling I/O commands from a connected client device. The script acts as a bridge and forwards commands to the ZMQ server script
+#sudo -u ubuntu python3 /home/ubuntu/Software/OPC-UA-Server-Bridge.py > /dev/shm/OPC-UA-Server-Bridge.log &
+# Search for a running instance of OPC
+PID=$(ps aux | grep 'OPC' | grep -v 'grep' | awk '{print $2}')
+if [ ! -z "$PID" ]; then
+    echo "OPC already running with PID $PID"
+else
+    echo "OPC is not running. Starting it..."
+    #sudo -u ubuntu python3 /home/ubuntu/Software/OPC-UA-Server-Bridge.py > /dev/shm/OPC-UA-Server-Bridge.log &
+    sudo -u ubuntu python3 /home/ubuntu/Software/OPC-UA-Server-Bridge.py > /dev/shm/OPC-UA-Server-Bridge.log 2>&1 &
+    #sleep 5
+fi
+
+# !!!!----DO NOT START ANY PYTHON SCRIPTS AFTER THE OPC-UA SERVER----!!!!
+# The OPC-UA server takes several seconds to initialize and if another python script is started while it's still initializing,
+# the script will fail to start.
+
+# Reset ZMonArg1, ZMonArg2, and ZMonArg3 to go back to set_th and  run 1 after calibration
+echo "ZMonArg1=\"set_th $threshold\"" > /home/ubuntu/Software/ZMonArg1.env
+
+echo "ZMonArg2=\"run $runInterval\"" > /home/ubuntu/Software/ZMonArg2.env
+
+echo "ZMonArg3=\"\"" > /home/ubuntu/Software/ZMonArg3.env
+
+exit 0
+

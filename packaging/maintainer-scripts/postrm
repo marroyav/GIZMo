@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload
+fi
+
+# Calibration and state under /var/lib/gizmo are deliberately retained,
+# including on purge. They are device-specific and expensive to reproduce.

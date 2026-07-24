@@ -1,0 +1,75 @@
+#!/bin/sh
+
+# Create log file for the startup script
+set -e
+LOG=/dev/shm/rc_startup.log
+exec >> "$LOG" 2>&1
+
+# Wait for Other I2C busses to be present before loading overlay
+echo "[rc.startup] Waiting for base I2C buses (0-6) to appear..."
+
+MAX_WAIT=20
+count=0
+while [ ! -e /dev/i2c-6 ]; do
+    sleep 1
+    count=$((count + 1))
+    if [ "$count" -ge "$MAX_WAIT" ]; then
+        echo "[rc.startup] Timeout waiting for /dev/i2c-6"
+        break
+    fi
+done
+
+echo "[rc.startup] Base I2C buses present. Proceeding with Network Stack..."
+
+# Wait for the ethernet stack to be functional, so that other system services such as i2c are functional
+while ! ip addr show lo | grep -q "inet "; do sleep 1; done
+
+echo "[rc.startup] Network stack loaded okay. Proceeding with overlay..."
+
+# Wait
+#sleep 10
+
+# Unload the default overlay
+xmutil unloadapp
+
+sleep 1
+
+# Load the GIZMo Firmware
+xmutil loadapp GIZMo_Kria_3_7_25
+
+sleep 1
+xmutil unloadapp
+
+sleep 1
+
+xmutil loadapp GIZMo_Kria_3_7_25
+# Wait
+sleep 1
+
+# Set static IP on eth0
+# Remove any existing addresses
+ip addr flush dev eth0
+
+# Assign Static IP and bring interface up
+ip addr add 192.168.0.150/24 dev eth0
+ip link set eth0 up
+
+# Add default gateway
+ip route add default via 192.168.0.1
+
+# Set static IP on eth1
+# Remove any existing addresses
+ip addr flush dev eth1
+
+# Assign static IP and bring interface up
+ip addr add 192.168.191.53/24 dev eth1
+ip link set eth1 up
+
+# Add default gateway
+#ip route add default via 192.168.1.1 dev eth1
+
+# Modify permissions of /dev/i2c-7
+chmod 666 /dev/i2c-7
+
+# Write a done file for /etc/rc.local to wait on
+touch /dev/shm/rc.startup.done
