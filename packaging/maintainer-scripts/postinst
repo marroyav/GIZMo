@@ -1,0 +1,30 @@
+#!/bin/sh
+set -eu
+
+if command -v systemd-sysusers >/dev/null 2>&1; then
+    systemd-sysusers /usr/lib/sysusers.d/gizmo.conf
+fi
+
+if command -v systemd-tmpfiles >/dev/null 2>&1; then
+    systemd-tmpfiles --create /usr/lib/tmpfiles.d/gizmo.conf
+fi
+
+if [ ! -e /var/lib/gizmo/config.bin ] && [ -r /usr/share/gizmo/default-state/config.bin.base64 ]; then
+    base64 -d /usr/share/gizmo/default-state/config.bin.base64 > /var/lib/gizmo/config.bin
+    chown root:gizmo /var/lib/gizmo/config.bin
+    chmod 0664 /var/lib/gizmo/config.bin
+fi
+
+if command -v udevadm >/dev/null 2>&1; then
+    udevadm control --reload-rules || true
+fi
+
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload
+    if [ -e /run/gizmo/restart-after-upgrade ]; then
+        rm -f /run/gizmo/restart-after-upgrade
+        systemctl start gizmo.target
+    fi
+fi
+
+echo "gizmo-runtime installed; run 'gizmo-doctor' before enabling gizmo.target"

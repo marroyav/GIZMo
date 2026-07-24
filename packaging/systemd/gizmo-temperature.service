@@ -1,0 +1,28 @@
+[Unit]
+Description=GIZMo chassis and CPU temperature service
+Requires=gizmo-hardware.service
+After=gizmo-hardware.service
+PartOf=gizmo.target
+
+[Service]
+Type=simple
+User=gizmo
+Group=gizmo
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/etc/gizmo/runtime.env
+ExecStart=/usr/bin/python3 /usr/libexec/gizmo/gizmo_temperature.py
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=no
+DevicePolicy=closed
+DeviceAllow=/dev/i2c-7 rw
+RestrictAddressFamilies=AF_INET AF_INET6
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=gizmo.target

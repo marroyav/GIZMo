@@ -1,0 +1,68 @@
+#!/bin/sh
+set -eu
+
+config_file=${GIZMO_NETWORK_CONFIG:-/etc/gizmo/network.env}
+if [ -r "$config_file" ]; then
+    . "$config_file"
+fi
+
+: "${GIZMO_NETWORK_MODE:=static}"
+: "${GIZMO_PS0_INTERFACE:=eth0}"
+: "${GIZMO_PS0_ADDRESS:=<redacted-private-ip>/24}"
+: "${GIZMO_PS1_INTERFACE:=eth1}"
+: "${GIZMO_PS1_ADDRESS:=<redacted-private-ip>/24}"
+: "${GIZMO_DEFAULT_GATEWAY:=<redacted-private-ip>}"
+
+validate_interface()
+{
+    case "$1" in
+        ''|*[!A-Za-z0-9_.:-]*)
+            echo "Invalid interface name: $1" >&2
+            return 1
+            ;;
+    esac
+    if [ ! -d "/sys/class/net/$1" ]; then
+        echo "Network interface does not exist: $1" >&2
+        return 1
+    fi
+}
+
+configure_static_interface()
+{
+    interface=$1
+    address=$2
+    validate_interface "$interface"
+    ip link set dev "$interface" up
+    ip -4 address flush dev "$interface" scope global
+    ip address add "$address" dev "$interface"
+}
+
+case "$GIZMO_NETWORK_MODE" in
+    none)
+        echo "Network configuration is externally managed"
+        exit 0
+        ;;
+    networkmanager)
+        command -v nmcli >/dev/null 2>&1 || {
+            echo "NetworkManager mode selected but nmcli is unavailable" >&2
+            exit 1
+        }
+        nmcli -t general status
+        echo "NetworkManager owns the PS interfaces"
+        exit 0
+        ;;
+    static)
+        configure_static_interface "$GIZMO_PS0_INTERFACE" "$GIZMO_PS0_ADDRESS"
+        configure_static_interface "$GIZMO_PS1_INTERFACE" "$GIZMO_PS1_ADDRESS"
+        if [ -n "$GIZMO_DEFAULT_GATEWAY" ]; then
+            ip route replace default via "$GIZMO_DEFAULT_GATEWAY" dev "$GIZMO_PS0_INTERFACE"
+        fi
+        ;;
+    *)
+        echo "Unsupported GIZMO_NETWORK_MODE: $GIZMO_NETWORK_MODE" >&2
+        exit 1
+        ;;
+esac
+
+ip -brief address show dev "$GIZMO_PS0_INTERFACE"
+ip -brief address show dev "$GIZMO_PS1_INTERFACE"

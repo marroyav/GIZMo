@@ -1,0 +1,21 @@
+[Unit]
+Description=Configure the two GIZMo Kria PS network ports
+After=local-fs.target
+Before=gizmo.target
+PartOf=gizmo.target
+
+[Service]
+Type=oneshot
+Environment=GIZMO_NETWORK_CONFIG=/etc/gizmo/network.env
+ExecStart=/usr/libexec/gizmo/gizmo-network-setup
+RemainAfterExit=yes
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
+
+[Install]
+WantedBy=gizmo.target

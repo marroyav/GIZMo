@@ -1,0 +1,53 @@
+#!/bin/sh
+set -eu
+
+config_file=${GIZMO_HARDWARE_CONFIG:-/etc/gizmo/hardware.env}
+if [ -r "$config_file" ]; then
+    . "$config_file"
+fi
+
+: "${GIZMO_OVERLAY_NAME:=GIZMo_Kria_3_7_25}"
+: "${GIZMO_OVERLAY_RELOAD:=1}"
+: "${GIZMO_READY_DEVICE:=/dev/i2c-6}"
+: "${GIZMO_I2C_DEVICE:=/dev/i2c-7}"
+: "${GIZMO_DEVICE_TIMEOUT:=120}"
+
+wait_for_device()
+{
+    device=$1
+    description=$2
+    remaining=$GIZMO_DEVICE_TIMEOUT
+    while [ ! -e "$device" ]; do
+        if [ "$remaining" -le 0 ]; then
+            echo "Timed out waiting for $description at $device" >&2
+            return 1
+        fi
+        sleep 1
+        remaining=$((remaining - 1))
+    done
+}
+
+command -v xmutil >/dev/null 2>&1 || {
+    echo "xmutil is required to load the Kria overlay" >&2
+    exit 1
+}
+
+wait_for_device "$GIZMO_READY_DEVICE" "base I2C controller"
+
+xmutil unloadapp >/dev/null 2>&1 || true
+xmutil loadapp "$GIZMO_OVERLAY_NAME"
+
+if [ "$GIZMO_OVERLAY_RELOAD" = "1" ]; then
+    xmutil unloadapp
+    xmutil loadapp "$GIZMO_OVERLAY_NAME"
+fi
+
+wait_for_device "$GIZMO_I2C_DEVICE" "overlay I2C controller"
+chgrp gizmo "$GIZMO_I2C_DEVICE"
+chmod 0660 "$GIZMO_I2C_DEVICE"
+
+if command -v udevadm >/dev/null 2>&1; then
+    udevadm settle --timeout="$GIZMO_DEVICE_TIMEOUT" || true
+fi
+
+echo "Loaded overlay $GIZMO_OVERLAY_NAME"

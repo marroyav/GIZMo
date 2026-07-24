@@ -1,0 +1,17 @@
+[Unit]
+Description=Load the GIZMo Kria FPGA overlay
+After=local-fs.target systemd-udevd.service
+Before=gizmo-zmon.service gizmo-display.service gizmo-temperature.service gizmo-sdr.service
+PartOf=gizmo.target
+
+[Service]
+Type=oneshot
+Environment=GIZMO_HARDWARE_CONFIG=/etc/gizmo/hardware.env
+ExecStart=/usr/libexec/gizmo/gizmo-hardware-setup
+ExecStop=-/usr/bin/xmutil unloadapp
+RemainAfterExit=yes
+TimeoutStartSec=180
+TimeoutStopSec=30
+
+[Install]
+WantedBy=gizmo.target

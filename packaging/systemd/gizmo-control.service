@@ -1,0 +1,26 @@
+[Unit]
+Description=Privileged GIZMo control helper
+Requires=gizmo-control.socket
+After=gizmo-control.socket
+PartOf=gizmo.target
+
+[Service]
+Type=simple
+ExecStart=/usr/libexec/gizmo/gizmo-control
+User=root
+Group=root
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_SYS_TIME
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+PrivateTmp=yes
+PrivateDevices=yes
+RestrictAddressFamilies=AF_UNIX
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=gizmo.target

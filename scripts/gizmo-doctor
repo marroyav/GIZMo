@@ -1,0 +1,35 @@
+#!/bin/sh
+set -u
+
+failed=0
+
+check()
+{
+    description=$1
+    shift
+    if "$@" >/dev/null 2>&1; then
+        printf 'ok   %s\n' "$description"
+    else
+        printf 'FAIL %s\n' "$description"
+        failed=1
+    fi
+}
+
+check "FPGA overlay definition" test -r /lib/firmware/xilinx/GIZMo_Kria_3_7_25/shell.json
+check "raw memory device" test -r /dev/mem
+check "display SPI device" test -e /dev/spidev3.0
+check "temperature I2C device" test -e /dev/i2c-7
+check "ZeroMQ Python module" python3 -c 'import zmq'
+check "SMBus Python module" python3 -c 'import smbus2'
+check "NumPy Python module" python3 -c 'import numpy'
+check "OPC-UA Python module" python3 -c 'import opcua'
+check "gizmo.target installed" systemctl cat gizmo.target
+
+if systemctl is-active --quiet gizmo.target; then
+    printf '\nActive services:\n'
+    systemctl --no-pager --plain list-dependencies gizmo.target
+else
+    printf '\ngizmo.target is installed but not active\n'
+fi
+
+exit "$failed"

@@ -1,0 +1,14 @@
+[Unit]
+Description=Privileged GIZMo control socket
+PartOf=gizmo.target
+
+[Socket]
+ListenStream=/run/gizmo/control.sock
+SocketUser=root
+SocketGroup=gizmo
+SocketMode=0660
+DirectoryMode=0775
+RemoveOnStop=yes
+
+[Install]
+WantedBy=gizmo.target

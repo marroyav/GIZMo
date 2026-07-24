@@ -1,0 +1,9 @@
+# Versions recovered from the working Ubuntu 22.04 Kria image.
+numpy==1.24.4
+opcua==0.98.13
+pyzmq==26.4.0
+smbus2==0.5.0
+lxml==5.4.0
+python-dateutil==2.8.1
+pytz==2022.1
+six==1.16.0
