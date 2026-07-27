@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import os
+import socket
 from pathlib import Path
-
 
 STATE_DIR = Path(os.environ.get("GIZMO_STATE_DIR", "/var/lib/gizmo"))
 CONTROL_SOCKET = os.environ.get("GIZMO_CONTROL_SOCKET", "/run/gizmo/control.sock")
@@ -49,3 +49,20 @@ def read_exported_int(name: str, variable: str, default: int) -> int:
             except ValueError:
                 return default
     return default
+
+
+def notify_systemd(*fields: str) -> bool:
+    """Send readiness, status, or watchdog fields without a Python binding."""
+    address = os.environ.get("NOTIFY_SOCKET", "")
+    if not address:
+        return False
+    if address.startswith("@"):
+        address = "\0" + address[1:]
+    payload = "\n".join(field for field in fields if field).encode("utf-8")
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as client:
+            client.connect(address)
+            client.sendall(payload)
+        return True
+    except OSError:
+        return False

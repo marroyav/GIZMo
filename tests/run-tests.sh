@@ -4,6 +4,7 @@ set -eu
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 temporary=$(mktemp -d /tmp/gizmo-tests.XXXXXX)
 control_pid=
+test_python=${PYTHON:-python3}
 
 cleanup()
 {
@@ -16,16 +17,33 @@ cleanup()
 trap cleanup EXIT HUP INT TERM
 
 for script in "$repo_root"/scripts/* "$repo_root"/packaging/*.sh "$repo_root"/packaging/maintainer-scripts/*; do
-    sh -n "$script"
+    case "$(sed -n '1p' "$script")" in
+        *python*) ;;
+        *) sh -n "$script" ;;
+    esac
 done
 echo "ok   shell syntax"
 
-PYTHONPYCACHEPREFIX="$temporary/pycache" python3 -m compileall -q \
-    "$repo_root/src/python" "$repo_root/tests/test_zmq_commands.py"
+PYTHONPYCACHEPREFIX="$temporary/pycache" "$test_python" -m compileall -q \
+    "$repo_root/src/python" "$repo_root/tests"
+PYTHONPYCACHEPREFIX="$temporary/pycache" "$test_python" -m py_compile \
+    "$repo_root/scripts/gizmo-opcua-client"
 echo "ok   Python syntax"
 
-PYTHONPYCACHEPREFIX="$temporary/pycache" python3 "$repo_root/tests/test_zmq_commands.py"
+PYTHONPYCACHEPREFIX="$temporary/pycache" "$test_python" "$repo_root/tests/test_zmq_commands.py"
 echo "ok   command compatibility tests"
+
+PYTHONPYCACHEPREFIX="$temporary/pycache" "$test_python" \
+    "$repo_root/tests/test_opcua_model.py"
+echo "ok   OPC UA semantic model tests"
+
+if "$test_python" -c 'import numpy, opcua, zmq' >/dev/null 2>&1; then
+    PYTHONPYCACHEPREFIX="$temporary/pycache" "$test_python" \
+        "$repo_root/tests/test_opcua_address_space.py"
+    echo "ok   OPC UA address-space integration tests"
+else
+    echo "skip OPC UA integration tests (runtime modules not installed on host)"
+fi
 
 cat > "$temporary/network.env" <<'EOF'
 GIZMO_NETWORK_MODE=none
@@ -95,5 +113,31 @@ if [ -s "$temporary/systemd-unexpected.log" ]; then
     exit "$verify_status"
 fi
 echo "ok   systemd unit syntax"
+
+if ! grep -q '^Wants=.*dfx-mgr\.service' \
+        "$repo_root/packaging/systemd/gizmo-hardware.service" ||
+    ! grep -q '^After=.*dfx-mgr\.service' \
+        "$repo_root/packaging/systemd/gizmo-hardware.service" ||
+    ! grep -q 'wait_for_device.*GIZMO_DFX_SOCKET' \
+        "$repo_root/scripts/gizmo-hardware-setup"; then
+    echo "FPGA overlay startup is not ordered after Xilinx dfx-mgr readiness" >&2
+    exit 1
+fi
+echo "ok   Xilinx DFX startup ordering"
+
+if ! grep -q '^TimeoutStartSec=90$' \
+        "$repo_root/packaging/systemd/gizmo-opcua.service"; then
+    echo "OPC UA cold-boot startup allowance regressed below the tested value" >&2
+    exit 1
+fi
+echo "ok   OPC UA cold-boot startup allowance"
+
+if grep -q '^Requires=' "$repo_root/packaging/systemd/gizmo.target" ||
+    grep -q '^Requires=.*gizmo-zmon' \
+        "$repo_root/packaging/systemd/gizmo-zmq.service"; then
+    echo "A ZMon restart would propagate into another lifecycle owner" >&2
+    exit 1
+fi
+echo "ok   isolated component restarts"
 
 echo "All host-side tests passed"

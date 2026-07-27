@@ -1,12 +1,15 @@
 #define _GNU_SOURCE
 
 #include <errno.h>
+#include <fcntl.h>
+#include <linux/rtc.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -66,6 +69,42 @@ static int run_systemctl_restart(void)
     return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : -1;
 }
 
+static int set_hardware_clock(time_t seconds)
+{
+    struct tm utc;
+    if (gmtime_r(&seconds, &utc) == NULL) {
+        return -1;
+    }
+
+    struct rtc_time requested = {
+        .tm_sec = utc.tm_sec,
+        .tm_min = utc.tm_min,
+        .tm_hour = utc.tm_hour,
+        .tm_mday = utc.tm_mday,
+        .tm_mon = utc.tm_mon,
+        .tm_year = utc.tm_year,
+        .tm_wday = utc.tm_wday,
+        .tm_yday = utc.tm_yday,
+        .tm_isdst = 0,
+    };
+    static const char *devices[] = {"/dev/rtc0", "/dev/rtc"};
+    for (size_t index = 0; index < sizeof(devices) / sizeof(devices[0]); index++) {
+        int fd = open(devices[index], O_RDWR | O_CLOEXEC);
+        if (fd < 0) {
+            continue;
+        }
+        int result = ioctl(fd, RTC_SET_TIME, &requested);
+        int saved_errno = errno;
+        close(fd);
+        errno = saved_errno;
+        if (result == 0) {
+            return 0;
+        }
+    }
+    return -1;
+}
+
+/* Return 0 when both clocks update, 1 when only CLOCK_REALTIME updates. */
 static int set_system_time(const char *value)
 {
     char *end = NULL;
@@ -84,7 +123,10 @@ static int set_system_time(const char *value)
         .tv_sec = (time_t)seconds,
         .tv_nsec = 0,
     };
-    return clock_settime(CLOCK_REALTIME, &requested);
+    if (clock_settime(CLOCK_REALTIME, &requested) != 0) {
+        return -1;
+    }
+    return set_hardware_clock(requested.tv_sec) == 0 ? 0 : 1;
 }
 
 static void handle_client(int client_fd)
@@ -119,8 +161,12 @@ static void handle_client(int client_fd)
 
     static const char prefix[] = "set-time ";
     if (strncmp(request, prefix, sizeof(prefix) - 1) == 0) {
-        if (set_system_time(request + sizeof(prefix) - 1) == 0) {
-            (void)write_response(client_fd, "OK system time updated\n");
+        int result = set_system_time(request + sizeof(prefix) - 1);
+        if (result == 0) {
+            (void)write_response(client_fd, "OK system time and RTC updated\n");
+        } else if (result == 1) {
+            (void)write_response(
+                client_fd, "OK system time updated; RTC update failed\n");
         } else {
             (void)write_response(client_fd, "ERR invalid time or clock_settime failed\n");
         }

@@ -1,6 +1,6 @@
 [Unit]
 Description=GIZMo ZeroMQ command service
-Requires=gizmo-zmon.service gizmo-control.socket
+Wants=gizmo-zmon.service gizmo-control.socket
 After=gizmo-zmon.service gizmo-control.socket
 PartOf=gizmo.target
 

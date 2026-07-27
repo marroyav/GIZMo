@@ -1,0 +1,288 @@
+#!/usr/bin/env python3
+"""Small operator/client utility for the canonical GIZMo OPC UA namespace."""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import math
+import os
+import sys
+from pathlib import Path
+from typing import Any
+
+# The Debian package owns a pinned runtime independent of per-user Python
+# installations.  Make the operator command use it even outside systemd.
+_BUNDLED_PYTHON = Path("/usr/lib/gizmo/python")
+if _BUNDLED_PYTHON.is_dir():
+    sys.path.insert(0, str(_BUNDLED_PYTHON))
+
+from opcua import Client, ua
+
+NAMESPACE_URI = "urn:fnal:gizmo"
+DEFAULT_ENDPOINT = os.environ.get(
+    "GIZMO_OPCUA_CLIENT_ENDPOINT", "opc.tcp://127.0.0.1:4840"
+)
+
+
+def json_value(value: Any) -> Any:
+    if isinstance(value, dt.datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=dt.timezone.utc)
+        return value.isoformat()
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, bytes):
+        return value.hex()
+    if isinstance(value, (list, tuple)):
+        return [json_value(item) for item in value]
+    if hasattr(value, "__dict__"):
+        return {
+            key: json_value(item)
+            for key, item in vars(value).items()
+            if not key.startswith("_")
+        }
+    return value
+
+
+def data_value(node: Any, *, include_value: bool = True) -> dict[str, Any]:
+    # Node.get_data_value() raises when the value-level StatusCode is Bad.
+    # A monitoring client must report that status rather than treating it as a
+    # failed OPC UA service call.
+    result = node.get_attributes([ua.AttributeIds.Value])[0]
+    payload: dict[str, Any] = {
+        "status": result.StatusCode.name,
+        "source_timestamp": json_value(result.SourceTimestamp),
+        "server_timestamp": json_value(result.ServerTimestamp),
+        "node_id": node.nodeid.to_string(),
+    }
+    if include_value:
+        payload["value"] = json_value(result.Value.Value)
+    return payload
+
+
+def canonical_node(client: Client, namespace: int, path: str) -> Any:
+    return client.get_node(ua.NodeId(f"GIZMo.{path}", namespace))
+
+
+def browse_snapshot(
+    node: Any,
+    *,
+    include_sdr_frame: bool,
+) -> dict[str, Any]:
+    snapshot: dict[str, Any] = {}
+    for child in node.get_children(refs=ua.ObjectIds.HasComponent):
+        browse_name = child.get_browse_name().Name
+        node_class = child.get_node_class()
+        if node_class == ua.NodeClass.Object:
+            snapshot[browse_name] = browse_snapshot(
+                child, include_sdr_frame=include_sdr_frame
+            )
+        elif node_class == ua.NodeClass.Variable:
+            include_value = not (browse_name == "LatestFrame" and not include_sdr_frame)
+            snapshot[browse_name] = data_value(child, include_value=include_value)
+            if not include_value:
+                snapshot[browse_name]["value_omitted"] = (
+                    "use --include-sdr-frame to retrieve this array"
+                )
+    return snapshot
+
+
+def schema_rows(node: Any, prefix: str = "") -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for child in node.get_children(refs=ua.ObjectIds.HasComponent):
+        browse_name = child.get_browse_name().Name
+        path = f"{prefix}/{browse_name}" if prefix else browse_name
+        node_class = child.get_node_class()
+        if node_class == ua.NodeClass.Object:
+            rows.extend(schema_rows(child, path))
+        elif node_class == ua.NodeClass.Variable:
+            try:
+                variant_type = child.get_data_type_as_variant_type().name
+            except (AttributeError, ua.UaError):
+                variant_type = child.get_data_type().to_string()
+            description = child.get_description()
+            row = {
+                "path": path,
+                "node_id": child.nodeid.to_string(),
+                "data_type": variant_type,
+                "description": description.Text if description else "",
+                "writable": bool(
+                    child.get_access_level() & {ua.AccessLevel.CurrentWrite}
+                ),
+            }
+            try:
+                unit = child.get_child(["0:EngineeringUnits"]).get_value()
+                row["engineering_unit"] = unit.DisplayName.Text
+                row["engineering_unit_namespace"] = unit.NamespaceUri
+                row["engineering_unit_id"] = unit.UnitId
+            except ua.UaError:
+                pass
+            try:
+                engineering_range = child.get_child(["0:EURange"]).get_value()
+                row["engineering_range"] = {
+                    "low": engineering_range.Low,
+                    "high": engineering_range.High,
+                }
+            except ua.UaError:
+                pass
+            rows.append(row)
+    return rows
+
+
+def read_paths(
+    client: Client, namespace: int, paths: tuple[str, ...]
+) -> dict[str, Any]:
+    return {
+        path.rpartition(".")[2]: data_value(canonical_node(client, namespace, path))
+        for path in paths
+    }
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Read and operate the canonical GIZMo OPC UA namespace"
+    )
+    parser.add_argument("--endpoint", default=DEFAULT_ENDPOINT)
+    parser.add_argument("--timeout", type=float, default=5.0)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers.add_parser("health", help="read aggregate health")
+    subparsers.add_parser("measurement", help="read the latest impedance result")
+    snapshot = subparsers.add_parser(
+        "snapshot", help="browse and read the complete canonical namespace"
+    )
+    snapshot.add_argument("--include-sdr-frame", action="store_true")
+    subparsers.add_parser("schema", help="list stable NodeIds and datatypes")
+    threshold = subparsers.add_parser("set-threshold", help="write the alarm threshold")
+    threshold.add_argument("ohm", type=int)
+    averages = subparsers.add_parser(
+        "set-averages", help="write measurements per calculation"
+    )
+    averages.add_argument("count", type=int)
+    subparsers.add_parser("clear-latch", help="call the ClearLatch method")
+    calibration = subparsers.add_parser(
+        "start-calibration", help="call StartCalibration"
+    )
+    calibration.add_argument("reads_per_point", type=int)
+    subparsers.add_parser("capture-adc", help="call CaptureAdc")
+    subparsers.add_parser("normalize-magnitude", help="call NormalizeMagnitude")
+    set_time = subparsers.add_parser(
+        "set-time", help="call SetSystemTime with an absolute ISO-8601 timestamp"
+    )
+    set_time.add_argument("timestamp")
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    client = Client(args.endpoint, timeout=args.timeout)
+    client.connect()
+    try:
+        namespace = client.get_namespace_index(NAMESPACE_URI)
+        if args.command == "health":
+            result = read_paths(
+                client,
+                namespace,
+                (
+                    "Health.Overall",
+                    "Health.LastUpdate",
+                    "Health.Measurement",
+                    "Health.Thermal",
+                    "Health.Time",
+                    "Health.OperatingSystem",
+                    "Health.Network",
+                    "Health.Storage",
+                    "Health.Firmware",
+                    "Health.Services",
+                    "Health.Calibration",
+                    "Health.SDR",
+                ),
+            )
+        elif args.command == "measurement":
+            result = read_paths(
+                client,
+                namespace,
+                (
+                    "Measurement.Sequence",
+                    "Measurement.SampleTime",
+                    "Measurement.ResistanceOhm",
+                    "Measurement.ResistanceRange",
+                    "Measurement.CapacitanceNanofarad",
+                    "Measurement.CapacitanceRange",
+                    "Measurement.ThresholdOhm",
+                    "Measurement.StimulusFrequencyHertz",
+                    "Measurement.Quality",
+                    "Measurement.Diagnostic",
+                    "Alarm.Active",
+                    "Alarm.Latched",
+                    "Alarm.Reason",
+                    "Alarm.LatchTime",
+                ),
+            )
+        elif args.command == "snapshot":
+            root = canonical_node(client, namespace, "Device")
+            result = browse_snapshot(root, include_sdr_frame=args.include_sdr_frame)
+        elif args.command == "schema":
+            root = canonical_node(client, namespace, "Device")
+            result = {
+                "namespace_uri": NAMESPACE_URI,
+                "namespace_index": namespace,
+                "variables": schema_rows(root),
+            }
+        elif args.command == "set-threshold":
+            if not 0 <= args.ohm <= 1_000_000:
+                raise SystemExit("threshold must be between 0 and 1000000")
+            node = canonical_node(client, namespace, "Configuration.ThresholdOhm")
+            node.set_value(ua.Variant(args.ohm, ua.VariantType.UInt32))
+            result = {"accepted_write": args.ohm, **data_value(node)}
+        elif args.command == "set-averages":
+            if not 1 <= args.count <= 1_000_000:
+                raise SystemExit("count must be between 1 and 1000000")
+            node = canonical_node(
+                client,
+                namespace,
+                "Configuration.AveragesPerCalculation",
+            )
+            node.set_value(ua.Variant(args.count, ua.VariantType.UInt32))
+            result = {"accepted_write": args.count, **data_value(node)}
+        else:
+            operations = canonical_node(client, namespace, "Operations")
+            if args.command == "clear-latch":
+                method_name, arguments = "ClearLatch", []
+            elif args.command == "start-calibration":
+                method_name = "StartCalibration"
+                arguments = [ua.Variant(args.reads_per_point, ua.VariantType.UInt32)]
+            elif args.command == "capture-adc":
+                method_name, arguments = "CaptureAdc", []
+            elif args.command == "set-time":
+                timestamp = args.timestamp.removesuffix("Z") + (
+                    "+00:00" if args.timestamp.endswith("Z") else ""
+                )
+                try:
+                    requested = dt.datetime.fromisoformat(timestamp)
+                except ValueError as error:
+                    raise SystemExit(f"invalid ISO-8601 timestamp: {error}") from error
+                if requested.tzinfo is None:
+                    raise SystemExit(
+                        "timestamp must include an explicit UTC offset or trailing Z"
+                    )
+                method_name = "SetSystemTime"
+                arguments = [
+                    ua.Variant(
+                        requested.astimezone(dt.timezone.utc),
+                        ua.VariantType.DateTime,
+                    )
+                ]
+            else:
+                method_name, arguments = "NormalizeMagnitude", []
+            method = canonical_node(client, namespace, f"Operations.{method_name}")
+            reply = operations.call_method(method, *arguments)
+            result = {"result": json_value(reply)}
+        print(json.dumps(result, indent=2, sort_keys=True))
+    finally:
+        client.disconnect()
+
+
+if __name__ == "__main__":
+    main()

@@ -10,7 +10,20 @@ fi
 : "${GIZMO_OVERLAY_RELOAD:=1}"
 : "${GIZMO_READY_DEVICE:=/dev/i2c-6}"
 : "${GIZMO_I2C_DEVICE:=/dev/i2c-7}"
+: "${GIZMO_DFX_SOCKET:=/tmp/dfx-mgrd.socket}"
 : "${GIZMO_DEVICE_TIMEOUT:=120}"
+: "${GIZMO_RUNTIME_DIR:=/run/gizmo}"
+
+capture_inventory()
+{
+    destination=$1
+    shift
+    temporary=$(mktemp "$GIZMO_RUNTIME_DIR/.inventory.XXXXXX")
+    "$@" >"$temporary" 2>&1 || true
+    chown root:gizmo "$temporary"
+    chmod 0640 "$temporary"
+    mv -f "$temporary" "$destination"
+}
 
 wait_for_device()
 {
@@ -33,6 +46,7 @@ command -v xmutil >/dev/null 2>&1 || {
 }
 
 wait_for_device "$GIZMO_READY_DEVICE" "base I2C controller"
+wait_for_device "$GIZMO_DFX_SOCKET" "Xilinx DFX manager socket"
 
 xmutil unloadapp >/dev/null 2>&1 || true
 xmutil loadapp "$GIZMO_OVERLAY_NAME"
@@ -45,6 +59,10 @@ fi
 wait_for_device "$GIZMO_I2C_DEVICE" "overlay I2C controller"
 chgrp gizmo "$GIZMO_I2C_DEVICE"
 chmod 0660 "$GIZMO_I2C_DEVICE"
+
+install -d -o gizmo -g gizmo -m 0775 "$GIZMO_RUNTIME_DIR"
+capture_inventory "$GIZMO_RUNTIME_DIR/xmutil-listapps.txt" xmutil listapps
+capture_inventory "$GIZMO_RUNTIME_DIR/xmutil-boardid.txt" xmutil boardid
 
 if command -v udevadm >/dev/null 2>&1; then
     udevadm settle --timeout="$GIZMO_DEVICE_TIMEOUT" || true

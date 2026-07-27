@@ -4,7 +4,7 @@
 
 `gizmo-runtime` is the only package-level owner. `gizmo.target` is the only
 operator-level lifecycle control. Internally, systemd supervises processes
-individually so a failed OPC-UA bridge does not kill measurements, and changing
+individually so a failed OPC UA server does not kill measurements, and changing
 a threshold restarts only ZMon instead of rerunning the entire boot script.
 
 ```text
@@ -17,11 +17,21 @@ gizmo.target
 │   └── gizmo-sdr.service ────── TCP 5556
 ├── gizmo-control.socket ─────── /run/gizmo/control.sock
 ├── gizmo-zmq.service ────────── TCP 5555
-└── gizmo-opcua.service ──────── TCP 4840
+└── gizmo-opcua.service ──────── OPC UA TCP 4840
 ```
 
-OPC-UA consumes ZeroMQ, temperature, and SDR. The display and ZeroMQ consume
-ZMon's TCP feed.
+The OPC UA server consumes ZeroMQ, temperature, and SDR and directly observes
+Linux time, OS resources, networking, storage, FPGA/board identity,
+calibration, and systemd state. Target members and producer dependencies use
+ordered `Wants`, not `Requires`, so a component restart does not deactivate the
+package target. `PartOf=gizmo.target` still gives the operator one complete
+start/stop boundary. The public server remains browsable and reports non-good
+OPC UA status codes when a producer fails. The display and compatibility
+ZeroMQ service consume ZMon's TCP feed.
+
+The typed `urn:fnal:gizmo` OPC UA namespace is the sole supported public
+machine contract. The recovered text and `SimpleOPCUAServer` interfaces are
+migration adapters.
 
 ## Privilege separation
 
@@ -30,7 +40,7 @@ GPIO sysfs nodes. Those processes retain narrowly bounded root execution until
 their device access can be converted to UIO, VFIO, GPIO character devices, or
 dedicated udev permissions.
 
-ZeroMQ, temperature, and OPC-UA run as the locked `gizmo` system user.
+ZeroMQ, temperature, and OPC UA run as the locked `gizmo` system user.
 The temperature I2C node is group-owned by `gizmo`.
 
 The legacy ZeroMQ server invoked arbitrary `sudo` commands and reran
@@ -41,7 +51,9 @@ group-restricted Unix socket. The C control helper accepts only:
 - `set-time <Unix-seconds>` in the years 2000–2100
 - `ping`
 
-No shell evaluates client data.
+No shell evaluates client data. A successful time update sets both the Linux
+wall clock and `/dev/rtc0`; the response explicitly reports the partial case
+where the wall clock changed but the hardware RTC did not.
 
 ## Filesystem ownership
 
@@ -60,19 +72,29 @@ therefore do not overwrite device calibration or operator values.
 
 ## Ordering and failure behavior
 
-1. Network setup and overlay loading are required by `gizmo.target`.
+1. Starting `gizmo.target` orders and starts network setup, overlay loading,
+   ZMon, the control socket, and the canonical OPC UA service.
 2. Hardware consumers require successful overlay setup.
 3. ZeroMQ requires ZMon and the privileged control socket.
-4. OPC-UA requires ZeroMQ, temperature, and SDR.
-5. Long-running services use bounded restart delays.
+4. OPC UA starts after its producers but remains available when an optional
+   producer fails.
+5. Long-running services use bounded restart delays; OPC UA additionally uses
+   systemd readiness and watchdog notifications.
 6. Stopping `gizmo.target` stops every component; hardware teardown unloads the
    overlay last through dependency ordering.
+
+An intentional ZMon restart does not stop `gizmo.target`, ZeroMQ, OPC UA, the
+display, or the sensor services. Consumers retain their sessions and expose a
+brief non-good source status until ZMon returns.
 
 All stdout/stderr goes to the journal. The package does not create unbounded
 multi-megabyte logs in `/dev/shm`.
 
 ## Compatibility
 
-The external ports, OPC-UA namespace/object/variable names, and documented
-ZeroMQ commands are retained. Persistent command values use the recovered
-environment-file format so rollback remains possible.
+The external legacy ports, OPC UA namespace/object/variable names, and
+documented text ZeroMQ commands are retained. Persistent command values use
+the recovered environment-file format so rollback remains possible. New
+clients resolve `urn:fnal:gizmo` by URI and use its stable string NodeIds.
+Breaking changes require a new major-version namespace URI rather than
+reinterpretation of an existing node.

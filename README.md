@@ -5,13 +5,13 @@ owned package, `gizmo-runtime`, with one operational entry point:
 `gizmo.target`.
 
 The package deliberately uses separate systemd services for the overlay,
-network, impedance monitor, display, ZeroMQ, temperature, SDR, and OPC-UA
+network, impedance monitor, display, ZeroMQ, temperature, SDR, and OPC UA
 components. Systemd owns startup ordering, privileges, restarts, logs, and
 shutdown. Operators still start and stop the product as one unit.
 
-> Status: migration candidate. The recovered release builds on x86-64 and
-> ARM64, but it has not yet replaced the legacy startup scripts on the borrowed
-> instrument. Installation does not enable or start `gizmo.target`.
+> Status: runtime 0.2.9 is the maintained package. It was installed and
+> cold-boot tested on the borrowed instrument on 27 July 2026. Installation
+> itself does not enable or start `gizmo.target`.
 
 ## Runtime map
 
@@ -25,7 +25,7 @@ shutdown. Operators still start and stop the product as one unit.
 | ZeroMQ command API | `gizmo-zmq.service` | TCP 5555 | `gizmo` |
 | temperature stream | `gizmo-temperature.service` | TCP 5005 | `gizmo` |
 | SDR stream | `gizmo-sdr.service` | TCP 5556 | root, `CAP_SYS_RAWIO` |
-| OPC-UA bridge | `gizmo-opcua.service` | TCP 4840 | `gizmo` |
+| canonical OPC UA server | `gizmo-opcua.service` | TCP 4840 | `gizmo` |
 
 Only the two Processing System Ethernet ports are configured. Defaults match
 the recovered board:
@@ -64,6 +64,22 @@ ARM64 wheel hashes are pinned in
 `packaging/wheelhouse-arm64.sha256` and checked before an offline package
 build.
 
+The supported monitoring and control contract is the typed OPC UA namespace
+`urn:fnal:gizmo` on TCP 4840. It exposes measurement quality and source
+timestamps along with OS, network, firmware, time, service, calibration, and
+SDR status:
+
+```sh
+gizmo-opcua-client health
+gizmo-opcua-client measurement
+gizmo-opcua-client snapshot
+gizmo-opcua-client schema
+```
+
+See [the OPC UA contract](docs/opcua.md). The recovered
+`SimpleOPCUAServer/CommandObject` namespace and text ZeroMQ API remain as
+compatibility interfaces during migration.
+
 On a non-Python-3.10 development host, a structure-only package can be checked
 with `BUNDLE_PYTHON_DEPS=0 make deb`. That artifact is not suitable for the
 Kria.
@@ -74,7 +90,7 @@ Read [the migration procedure](docs/migration.md) before touching a running
 legacy image. The safe high-level sequence is:
 
 ```sh
-sudo dpkg -i build/gizmo-runtime_0.1.0_arm64.deb
+sudo dpkg -i build/gizmo-runtime_0.2.9_arm64.deb
 sudo gizmo-doctor
 ```
 

@@ -19,24 +19,41 @@ Copy the backup off the instrument.
 ## 2. Install without activating
 
 ```sh
-sudo dpkg -i gizmo-runtime_0.1.0_arm64.deb
+sudo dpkg -i gizmo-runtime_0.2.9_arm64.deb
 sudo gizmo-doctor
 ```
 
 Resolve every failed dependency/device check before proceeding.
 
-The package seeds `/var/lib/gizmo` only when a file is absent. If calibration
-has changed since this repository was captured, copy the live files over while
-the legacy stack is stopped:
+The package seeds `/var/lib/gizmo` only when a file is absent. Preserve the
+complete device-specific state, not just the calibration tables. Copy the live
+files over while the legacy stack is stopped:
 
 ```sh
 sudo install -o root -g gizmo -m 0664 \
+  /home/ubuntu/Software/adc.csv \
   /home/ubuntu/Software/Rcalibration.csv \
   /home/ubuntu/Software/Rcalibration_ph.csv \
   /home/ubuntu/Software/Ccalibration.csv \
   /home/ubuntu/Software/Ccalibration_ph.csv \
   /var/lib/gizmo/
+
+sudo install -o gizmo -g gizmo -m 0664 \
+  /home/ubuntu/Software/setThreshold.env \
+  /home/ubuntu/Software/setRunInterval.env \
+  /home/ubuntu/Software/ZMonArg1.env \
+  /home/ubuntu/Software/ZMonArg2.env \
+  /home/ubuntu/Software/ZMonArg3.env \
+  /home/ubuntu/Software/resistance.env \
+  /home/ubuntu/Software/capacitance.env \
+  /home/ubuntu/Software/normalizeMagFlag.env \
+  /home/ubuntu/Software/latchState.env \
+  /var/lib/gizmo/
 ```
+
+If the legacy image has `/home/ubuntu/Software/config.bin`, install it as
+`root:gizmo` mode `0664` too. Verify checksums against the rollback archive
+before starting the new runtime.
 
 ## 3. Transfer lifecycle ownership
 
@@ -70,11 +87,15 @@ At minimum:
 1. both expected static addresses are present;
 2. `xmutil listapps` shows `GIZMo_Kria_3_7_25`;
 3. all five TCP ports listen;
-4. `get_data` returns a plausible measurement;
-5. temperature and SDR frames are complete;
-6. the front-panel display updates;
-7. threshold changes restart only `gizmo-zmon.service`;
-8. a reboot returns the same state and addresses.
+4. `gizmo-opcua-client health` reaches `urn:fnal:gizmo`;
+5. `gizmo-opcua-client measurement` returns plausible typed values, OPC UA
+   status codes, and source timestamps;
+6. legacy `get_data` still returns a plausible compatibility record;
+7. temperature and SDR frames are complete;
+8. the front-panel display updates;
+9. threshold changes restart only `gizmo-zmon.service`;
+10. a reboot returns the same state, MAC addresses, and IP addresses, and
+    `Network/Interfaces/*/MacAddressSource` reports their observed provenance.
 
 Use `journalctl -u 'gizmo-*' -b` for diagnostics.
 
@@ -86,6 +107,9 @@ device-specific tables, and takes several minutes.
 ```sh
 sudo systemctl disable --now gizmo.target
 sudo systemctl unmask rc-local.service rc.startup.service
+sudo mv /etc/systemd/system/rc.startup.service.gizmo-legacy-disabled \
+  /etc/systemd/system/rc.startup.service
+sudo systemctl daemon-reload
 sudo systemctl enable --now rc.startup.service
 sudo systemctl start rc-local.service
 ```
