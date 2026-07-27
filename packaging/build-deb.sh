@@ -70,8 +70,8 @@ Maintainer: Manuel Arroyave <marroyav@users.noreply.github.com>
 Depends: iproute2, python3 (>= 3.10), python3 (<< 3.11), systemd, udev
 Description: GIZMo Kria slow-control runtime
  Owns FPGA overlay loading, PS-port network configuration, ZMon,
- the front-panel display, ZeroMQ, temperature, SDR, and the canonical
- OPC UA monitoring and control service.
+ the front-panel display, ZeroMQ, temperature, SDR, the canonical OPC UA
+ monitoring and control service, and its read-only live web dashboard.
 Installed-Size: $installed_size
 EOF
 

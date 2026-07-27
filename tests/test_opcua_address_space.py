@@ -80,7 +80,7 @@ class AddressSpaceTests(unittest.TestCase):
         )
         self.assertEqual(
             self.node("Identity.ModelVersion").get_value(),
-            "1.1.0",
+            "1.1.1",
         )
 
     def test_legacy_command_object_is_preserved(self) -> None:
@@ -104,6 +104,13 @@ class AddressSpaceTests(unittest.TestCase):
 
         self.assertIn("BadOutOfRange", description.Text)
         self.assertNotIn("1050", description.Text)
+
+    def test_dashboard_service_is_part_of_owned_runtime_inventory(self) -> None:
+        variant_type = self.node(
+            "Services.Units.gizmo_dashboard_service.ActiveState"
+        ).get_data_type_as_variant_type()
+
+        self.assertEqual(variant_type, ua.VariantType.String)
 
     def test_canonical_threshold_write_forwards_to_legacy_engine(self) -> None:
         threshold = self.node("Configuration.ThresholdOhm")

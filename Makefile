@@ -52,6 +52,8 @@ install: all
 	install -d -m 0755 $(DESTDIR)$(PREFIX)/libexec/gizmo
 	install -m 0644 src/python/*.py $(DESTDIR)$(PREFIX)/libexec/gizmo/
 	install -D -m 0644 VERSION $(DESTDIR)$(PREFIX)/share/gizmo/VERSION
+	install -d -m 0755 $(DESTDIR)$(PREFIX)/share/gizmo/dashboard
+	install -m 0644 web/dashboard/* $(DESTDIR)$(PREFIX)/share/gizmo/dashboard/
 	install -d -m 0755 $(DESTDIR)/etc/gizmo
 	install -m 0644 config/hardware.env config/network.env config/runtime.env $(DESTDIR)/etc/gizmo/
 	install -d -m 0755 $(DESTDIR)$(PREFIX)/share/gizmo/default-state

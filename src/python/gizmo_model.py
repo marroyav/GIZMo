@@ -26,7 +26,7 @@ from gizmo_common import read_exported_int, state_path
 
 MODEL_NAMESPACE_URI = "urn:fnal:gizmo"
 LEGACY_NAMESPACE_URI = "SimpleOPCUAServer"
-MODEL_VERSION = "1.1.0"
+MODEL_VERSION = "1.1.1"
 MODEL_PUBLICATION_DATE = dt.datetime(2026, 7, 27, tzinfo=dt.timezone.utc)
 
 QUALITY_GOOD = "Good"
@@ -77,6 +77,7 @@ SYSTEMD_UNITS = (
     "gizmo-sdr.service",
     "gizmo-zmq.service",
     "gizmo-opcua.service",
+    "gizmo-dashboard.service",
 )
 REQUIRED_UNITS = {
     "gizmo.target",
@@ -85,6 +86,7 @@ REQUIRED_UNITS = {
     "gizmo-control.socket",
     "gizmo-zmon.service",
     "gizmo-opcua.service",
+    "gizmo-dashboard.service",
 }
 
 _FIELD_PATTERN = re.compile(r"(?:^|,)\s*([A-Za-z][A-Za-z0-9_]*)=([^,]*)")

@@ -19,7 +19,7 @@ Copy the backup off the instrument.
 ## 2. Install without activating
 
 ```sh
-sudo dpkg -i gizmo-runtime_0.2.9_arm64.deb
+sudo dpkg -i gizmo-runtime_0.3.0_arm64.deb
 sudo gizmo-doctor
 ```
 
@@ -69,7 +69,7 @@ Confirm the legacy processes and ports are gone:
 
 ```sh
 pgrep -af 'ZMon|EVE-main|zmqServer|Temperature.MCP9808|SDR2|OPC-UA'
-sudo ss -lntp | grep -E ':(4840|5005|5055|5555|5556)\b' || true
+sudo ss -lntp | grep -E ':(8080|4840|5005|5055|5555|5556)\b' || true
 ```
 
 Now activate the package:
@@ -86,7 +86,7 @@ At minimum:
 
 1. both expected static addresses are present;
 2. `xmutil listapps` shows `GIZMo_Kria_3_7_25`;
-3. all five TCP ports listen;
+3. all six TCP ports listen;
 4. `gizmo-opcua-client health` reaches `urn:fnal:gizmo`;
 5. `gizmo-opcua-client measurement` returns plausible typed values, OPC UA
    status codes, and source timestamps;
@@ -96,6 +96,8 @@ At minimum:
 9. threshold changes restart only `gizmo-zmon.service`;
 10. a reboot returns the same state, MAC addresses, and IP addresses, and
     `Network/Interfaces/*/MacAddressSource` reports their observed provenance.
+11. `http://<gizmo-address>:8080/` shows live OPC UA values and
+    `/healthz` reports `opcua_connected: true`.
 
 Use `journalctl -u 'gizmo-*' -b` for diagnostics.
 

@@ -1,0 +1,44 @@
+[Unit]
+Description=GIZMo read-only live web dashboard
+Documentation=file:/usr/share/doc/gizmo-runtime/dashboard.md
+Wants=gizmo-opcua.service
+After=gizmo-network.service gizmo-opcua.service
+PartOf=gizmo.target
+
+[Service]
+Type=simple
+User=gizmo
+Group=gizmo
+UMask=0077
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+EnvironmentFile=/etc/gizmo/runtime.env
+ExecStart=/usr/bin/python3 /usr/libexec/gizmo/gizmo_dashboard.py
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=10
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+TasksMax=64
+LimitNOFILE=1024
+
+[Install]
+WantedBy=gizmo.target
