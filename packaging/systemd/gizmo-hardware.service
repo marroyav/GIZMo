@@ -1,6 +1,7 @@
 [Unit]
 Description=Load the GIZMo Kria FPGA overlay
-After=local-fs.target systemd-udevd.service
+Wants=dfx-mgr.service
+After=local-fs.target systemd-udevd.service dfx-mgr.service
 Before=gizmo-zmon.service gizmo-display.service gizmo-temperature.service gizmo-sdr.service
 PartOf=gizmo.target
 

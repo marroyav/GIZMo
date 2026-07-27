@@ -1,9 +1,10 @@
 [Unit]
 Description=GIZMo Kria runtime
 Documentation=file:/usr/share/doc/gizmo-runtime/README.md
-Requires=gizmo-hardware.service gizmo-network.service gizmo-zmon.service gizmo-control.socket
-Wants=gizmo-display.service gizmo-temperature.service gizmo-sdr.service gizmo-zmq.service gizmo-opcua.service
-After=gizmo-hardware.service gizmo-network.service
+Wants=gizmo-hardware.service gizmo-network.service gizmo-zmon.service gizmo-control.socket gizmo-opcua.service
+Wants=gizmo-display.service gizmo-temperature.service gizmo-sdr.service gizmo-zmq.service
+After=gizmo-hardware.service gizmo-network.service gizmo-zmon.service gizmo-control.socket gizmo-opcua.service
+After=gizmo-display.service gizmo-temperature.service gizmo-sdr.service gizmo-zmq.service
 
 [Install]
 WantedBy=multi-user.target

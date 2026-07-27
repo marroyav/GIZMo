@@ -99,6 +99,25 @@ class CommandTests(unittest.TestCase):
             "export runInterval=100\n",
         )
 
+    @mock.patch.object(
+        gizmo_zmq,
+        "request_control",
+        side_effect=("system time updated", "zmon restart requested"),
+    )
+    def test_epoch_time_command_uses_allow_listed_control(
+        self, request: mock.Mock
+    ) -> None:
+        reply = gizmo_zmq.handle_message("set_time_epoch 1785168000")
+
+        self.assertIn("system time updated", reply)
+        self.assertEqual(
+            request.call_args_list,
+            [
+                mock.call("set-time 1785168000"),
+                mock.call("restart-zmon"),
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

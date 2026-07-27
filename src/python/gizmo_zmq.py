@@ -116,6 +116,17 @@ def handle_message(message: str) -> str:
         restart_result = request_control("restart-zmon")
         return f"{time_result}; {restart_result}."
 
+    if message.startswith("set_time_epoch "):
+        epoch_text = message.removeprefix("set_time_epoch ").strip()
+        if not epoch_text.isdigit():
+            return "Invalid epoch format. Use 'set_time_epoch SECONDS'."
+        epoch_seconds = int(epoch_text)
+        if epoch_seconds < 946_684_800 or epoch_seconds > 4_102_444_800:
+            return "Epoch must represent a time from 2000-01-01 through 2100-01-01."
+        time_result = request_control(f"set-time {epoch_seconds}")
+        restart_result = request_control("restart-zmon")
+        return f"{time_result}; {restart_result}."
+
     if message == "get_adc":
         return read_text_file("adc.csv")
     if message == "get_Rcal":

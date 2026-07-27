@@ -1,21 +1,53 @@
 #!/usr/bin/env python3
-"""OPC-UA bridge exposing the legacy GIZMo slow-control surface."""
+"""Canonical OPC UA server and legacy compatibility bridge for GIZMo."""
 
 from __future__ import annotations
 
+import datetime as dt
+import hashlib
+import math
 import os
+import re
+import signal
 import socket
 import threading
 import time
+from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
+from pathlib import Path
 
 import numpy as np
 import zmq
+from gizmo_common import atomic_write, notify_systemd, read_exported_int, state_path
+from gizmo_model import (
+    LEGACY_NAMESPACE_URI,
+    MODEL_NAMESPACE_URI,
+    MODEL_PUBLICATION_DATE,
+    MODEL_VERSION,
+    QUALITY_BAD,
+    QUALITY_GOOD,
+    QUALITY_NOT_AVAILABLE,
+    QUALITY_UNCERTAIN,
+    RANGE_OUT_OF_RANGE,
+    CalibrationSnapshot,
+    FirmwareSnapshot,
+    HostSnapshot,
+    MeasurementSnapshot,
+    NetworkSnapshot,
+    ServiceInventorySnapshot,
+    StorageSnapshot,
+    SystemCollectors,
+    ThermalSnapshot,
+    TimeSnapshot,
+    parse_legacy_measurement,
+    parse_legacy_thermals,
+    runtime_version,
+    utc_now,
+)
 from opcua import Server, ua
 
-from gizmo_common import atomic_write, read_exported_int, state_path
-
-
 ENDPOINT = os.environ.get("GIZMO_OPCUA_ENDPOINT", "opc.tcp://0.0.0.0:4840")
+APPLICATION_URI = os.environ.get("GIZMO_OPCUA_APPLICATION_URI", "urn:fnal:gizmo:server")
 ZMQ_ENDPOINT = os.environ.get("GIZMO_ZMQ_CLIENT_ENDPOINT", "tcp://127.0.0.1:5555")
 TEMPERATURE_HOST = os.environ.get("GIZMO_TEMPERATURE_CLIENT_HOST", "127.0.0.1")
 TEMPERATURE_PORT = int(os.environ.get("GIZMO_TEMPERATURE_PORT", "5005"))
@@ -23,65 +55,1824 @@ SDR_HOST = os.environ.get("GIZMO_SDR_CLIENT_HOST", "127.0.0.1")
 SDR_PORT = int(os.environ.get("GIZMO_SDR_PORT", "5556"))
 SDR_SAMPLE_COUNT = int(os.environ.get("GIZMO_SDR_SAMPLE_COUNT", "2048"))
 REQUEST_TIMEOUT_MS = int(os.environ.get("GIZMO_BRIDGE_TIMEOUT_MS", "3000"))
+MEASUREMENT_INTERVAL = float(os.environ.get("GIZMO_OPCUA_MEASUREMENT_INTERVAL", "1"))
+PLATFORM_INTERVAL = float(os.environ.get("GIZMO_OPCUA_PLATFORM_INTERVAL", "10"))
+INVENTORY_INTERVAL = float(os.environ.get("GIZMO_OPCUA_INVENTORY_INTERVAL", "30"))
+SDR_INTERVAL = float(os.environ.get("GIZMO_OPCUA_SDR_INTERVAL", "1"))
+
+_MISSING_DATETIME = dt.datetime(1601, 1, 1, tzinfo=dt.timezone.utc)
+_UNIT_IDS = {
+    "Ohm": 1,
+    "nF": 2,
+    "Hz": 3,
+    "deg": 4,
+    "Cel": 5,
+    "%": 6,
+    "s": 7,
+    "byte": 8,
+    "Mbit/s": 9,
+}
 
 
 class GizmoOpcUaServer:
+    """One browsable, typed OPC UA address space for the complete instrument."""
+
     def __init__(self) -> None:
         self._context = zmq.Context.instance()
         self._request_lock = threading.Lock()
+        self._executor = ThreadPoolExecutor(
+            max_workers=8, thread_name_prefix="gizmo-opcua"
+        )
+        self._collectors = SystemCollectors()
+        self._jobs: dict[str, Future[object]] = {}
+        self._next_run: dict[str, float] = {}
+        self._attempted: set[str] = set()
+        self._has_data: set[str] = set()
+        self._category_quality: dict[str, str] = {}
+        self._points: dict[str, tuple[object, object, object]] = {}
+        self._interface_points: dict[str, dict[str, str]] = {}
+        self._filesystem_points: dict[str, dict[str, str]] = {}
+        self._service_points: dict[str, dict[str, str]] = {}
+        self._calibration_points: dict[str, dict[str, str]] = {}
+        self._measurement_sequence = 0
+        self._sdr_sequence = 0
+        self._adc_ready_at: float | None = None
+        self._running = True
+        self._ready_sent = False
+        self._last_notified_health = ""
+        self._started_at = utc_now()
+
         self.server = Server()
         self.server.set_endpoint(ENDPOINT)
-        self.namespace = self.server.register_namespace("SimpleOPCUAServer")
-        command_object = self.server.get_objects_node().add_object(
-            self.namespace, "CommandObject"
+        self.server.set_server_name("Fermilab GIZMo OPC UA Server")
+        self.server.set_application_uri(APPLICATION_URI)
+        version = runtime_version()
+        self.server.set_build_info(
+            MODEL_NAMESPACE_URI,
+            "Fermi National Accelerator Laboratory",
+            "GIZMo Kria Runtime",
+            version,
+            os.environ.get("GIZMO_BUILD_ID", ""),
+            self._started_at,
         )
+        self._configure_security()
 
-        command_object.add_method(
-            self.namespace,
-            "send_command",
-            self.send_command,
-            [ua.VariantType.String],
-            [ua.VariantType.String],
-        )
+        # Register the recovered URI first so its namespace index remains
+        # compatible with the legacy bridge. New clients resolve the canonical
+        # namespace by URI instead of assuming an index.
+        self.legacy_namespace = self.server.register_namespace(LEGACY_NAMESPACE_URI)
+        self.namespace = self.server.register_namespace(MODEL_NAMESPACE_URI)
+
+        self._build_legacy_model()
+        self._build_canonical_model()
+        self._mark_initial_values()
 
         threshold = read_exported_int("setThreshold.env", "threshold", 100)
         run_interval = read_exported_int("setRunInterval.env", "runInterval", 100)
-
-        self.set_threshold = command_object.add_variable(self.namespace, "set_th", threshold)
-        self.set_threshold.set_writable()
-        self.data = command_object.add_variable(self.namespace, "data", "")
-        self.set_time = command_object.add_variable(self.namespace, "set_time", "")
-        self.set_time.set_writable()
-        self.clear_latch = command_object.add_variable(self.namespace, "clear_latch", "")
-        self.clear_latch.set_writable()
-        self.measurements = command_object.add_variable(
-            self.namespace, "measurements_per_calc", run_interval
-        )
-        self.measurements.set_writable()
-        self.calibrate = command_object.add_variable(self.namespace, "calibrate", 0)
-        self.calibrate.set_writable()
-        self.read_adc = command_object.add_variable(self.namespace, "ReadADC", 0)
-        self.read_adc.set_writable()
-        self.csv_data = command_object.add_variable(self.namespace, "csvData", "")
-        self.resistance_calibration = command_object.add_variable(
-            self.namespace, "RCalData", ""
-        )
-        self.capacitance_calibration = command_object.add_variable(
-            self.namespace, "CCalData", ""
-        )
-        self.thermals = command_object.add_variable(self.namespace, "thermals", "")
-        self.sdr = command_object.add_variable(
-            self.namespace, "SDR", ua.Variant([], ua.VariantType.Int32)
-        )
-        self.normalize = command_object.add_variable(self.namespace, "normalize", 0)
-        self.normalize.set_writable()
-
         self._last_threshold = threshold
         self._last_run_interval = run_interval
-        self._last_time = self.set_time.get_value()
+        self._last_time = self.legacy_set_time.get_value()
+
+    def _configure_security(self) -> None:
+        certificate = os.environ.get("GIZMO_OPCUA_CERTIFICATE", "").strip()
+        private_key = os.environ.get("GIZMO_OPCUA_PRIVATE_KEY", "").strip()
+        allow_insecure = (
+            os.environ.get("GIZMO_OPCUA_ALLOW_INSECURE", "1").strip() == "1"
+        )
+        if bool(certificate) != bool(private_key):
+            raise RuntimeError(
+                "both GIZMO_OPCUA_CERTIFICATE and GIZMO_OPCUA_PRIVATE_KEY "
+                "must be configured together"
+            )
+        policies = []
+        if certificate and private_key:
+            self.server.load_certificate(certificate)
+            self.server.load_private_key(private_key)
+            policies.extend(
+                [
+                    ua.SecurityPolicyType.Basic256Sha256_SignAndEncrypt,
+                    ua.SecurityPolicyType.Basic256Sha256_Sign,
+                ]
+            )
+        elif not allow_insecure:
+            raise RuntimeError(
+                "GIZMO_OPCUA_ALLOW_INSECURE=0 requires a certificate and private key"
+            )
+        if allow_insecure:
+            policies.append(ua.SecurityPolicyType.NoSecurity)
+        self.server.set_security_policy(policies)
+        self.server.set_security_IDs(["Anonymous"])
+
+    @staticmethod
+    def _safe_identifier(value: str) -> str:
+        normalized = re.sub(r"[^A-Za-z0-9]+", "_", value).strip("_")
+        return normalized or hashlib.sha256(value.encode()).hexdigest()[:12]
+
+    def _node_id(self, path: str) -> ua.NodeId:
+        return ua.NodeId(f"GIZMo.{path}", self.namespace)
+
+    def _browse_name(self, name: str) -> ua.QualifiedName:
+        return ua.QualifiedName(name, self.namespace)
+
+    @staticmethod
+    def _set_description(node: object, description: str) -> None:
+        value = ua.DataValue(
+            ua.Variant(ua.LocalizedText(description), ua.VariantType.LocalizedText)
+        )
+        node.set_attribute(ua.AttributeIds.Description, value)
+
+    def _add_object(
+        self, parent: object, path: str, name: str, description: str
+    ) -> object:
+        node = parent.add_object(self._node_id(path), self._browse_name(name))
+        self._set_description(node, description)
+        return node
+
+    def _unit_information(self, symbol: str) -> ua.EUInformation:
+        unit = ua.EUInformation()
+        unit.NamespaceUri = f"{MODEL_NAMESPACE_URI}:units"
+        unit.UnitId = _UNIT_IDS[symbol]
+        unit.DisplayName = ua.LocalizedText(symbol)
+        unit.Description = ua.LocalizedText(symbol)
+        return unit
+
+    def _add_point(
+        self,
+        parent: object,
+        path: str,
+        name: str,
+        default: object,
+        variant_type: object,
+        description: str,
+        *,
+        unit: str | None = None,
+        value_range: tuple[float, float] | None = None,
+        writable: bool = False,
+    ) -> object:
+        node = parent.add_variable(
+            self._node_id(path),
+            self._browse_name(name),
+            default,
+            variant_type,
+        )
+        self._set_description(node, description)
+        if writable:
+            node.set_writable()
+        if unit is not None:
+            node.add_property(
+                ua.NodeId(f"GIZMo.{path}.EngineeringUnits", self.namespace),
+                ua.QualifiedName("EngineeringUnits", 0),
+                self._unit_information(unit),
+                datatype=ua.NodeId(ua.ObjectIds.EUInformation, 0),
+            )
+        if value_range is not None:
+            engineering_range = ua.Range()
+            engineering_range.Low = value_range[0]
+            engineering_range.High = value_range[1]
+            node.add_property(
+                ua.NodeId(f"GIZMo.{path}.EURange", self.namespace),
+                ua.QualifiedName("EURange", 0),
+                engineering_range,
+                datatype=ua.NodeId(ua.ObjectIds.Range, 0),
+            )
+        self._points[path] = (node, variant_type, default)
+        return node
+
+    def _add_method(
+        self,
+        parent: object,
+        path: str,
+        name: str,
+        callback: Callable[..., object],
+        inputs: list[object],
+        description: str,
+    ) -> object:
+        node = parent.add_method(
+            self._node_id(path),
+            self._browse_name(name),
+            callback,
+            inputs,
+            [ua.VariantType.String],
+        )
+        self._set_description(node, description)
+        return node
+
+    def _build_legacy_model(self) -> None:
+        command = self.server.get_objects_node().add_object(
+            self.legacy_namespace, "CommandObject"
+        )
+        command.add_method(
+            self.legacy_namespace,
+            "send_command",
+            self.send_legacy_command,
+            [ua.VariantType.String],
+            [ua.VariantType.String],
+        )
+        threshold = read_exported_int("setThreshold.env", "threshold", 100)
+        run_interval = read_exported_int("setRunInterval.env", "runInterval", 100)
+        self.legacy_threshold = command.add_variable(
+            self.legacy_namespace, "set_th", threshold
+        )
+        self.legacy_threshold.set_writable()
+        self.legacy_data = command.add_variable(self.legacy_namespace, "data", "")
+        self.legacy_set_time = command.add_variable(
+            self.legacy_namespace, "set_time", ""
+        )
+        self.legacy_set_time.set_writable()
+        self.legacy_clear_latch = command.add_variable(
+            self.legacy_namespace, "clear_latch", ""
+        )
+        self.legacy_clear_latch.set_writable()
+        self.legacy_measurements = command.add_variable(
+            self.legacy_namespace, "measurements_per_calc", run_interval
+        )
+        self.legacy_measurements.set_writable()
+        self.legacy_calibrate = command.add_variable(
+            self.legacy_namespace, "calibrate", 0
+        )
+        self.legacy_calibrate.set_writable()
+        self.legacy_read_adc = command.add_variable(self.legacy_namespace, "ReadADC", 0)
+        self.legacy_read_adc.set_writable()
+        self.legacy_csv_data = command.add_variable(
+            self.legacy_namespace, "csvData", ""
+        )
+        self.legacy_resistance_calibration = command.add_variable(
+            self.legacy_namespace, "RCalData", ""
+        )
+        self.legacy_capacitance_calibration = command.add_variable(
+            self.legacy_namespace, "CCalData", ""
+        )
+        self.legacy_thermals = command.add_variable(
+            self.legacy_namespace, "thermals", ""
+        )
+        self.legacy_sdr = command.add_variable(
+            self.legacy_namespace,
+            "SDR",
+            ua.Variant([], ua.VariantType.Int32),
+        )
+        self.legacy_normalize = command.add_variable(
+            self.legacy_namespace, "normalize", 0
+        )
+        self.legacy_normalize.set_writable()
+
+    def _build_canonical_model(self) -> None:
+        objects = self.server.get_objects_node()
+        root = self._add_object(
+            objects,
+            "Device",
+            "GIZMo",
+            "Fermilab Ground Impedance Monitor instrument.",
+        )
+
+        identity = self._add_object(
+            root,
+            "Identity",
+            "Identity",
+            "Stable instrument, software, and information-model identity.",
+        )
+        identity_values = (
+            (
+                "Identity.Manufacturer",
+                "Manufacturer",
+                "Fermi National Accelerator Laboratory",
+                "Organization responsible for this runtime package.",
+            ),
+            (
+                "Identity.ProductName",
+                "ProductName",
+                "GIZMo Kria",
+                "Ground Impedance Monitor using the AMD Kria platform.",
+            ),
+            (
+                "Identity.ModelNamespaceUri",
+                "ModelNamespaceUri",
+                MODEL_NAMESPACE_URI,
+                "Canonical namespace URI; clients resolve its runtime index.",
+            ),
+            (
+                "Identity.ModelVersion",
+                "ModelVersion",
+                MODEL_VERSION,
+                "Semantic version of this OPC UA information model.",
+            ),
+            (
+                "Identity.RuntimeVersion",
+                "RuntimeVersion",
+                runtime_version(),
+                "Installed gizmo-runtime package version.",
+            ),
+            (
+                "Identity.Hostname",
+                "Hostname",
+                socket.gethostname(),
+                "Current Linux host name.",
+            ),
+            (
+                "Identity.BootId",
+                "BootId",
+                self._read_text("/proc/sys/kernel/random/boot_id"),
+                "Linux boot identifier; changes on every boot.",
+            ),
+            (
+                "Identity.DeviceId",
+                "DeviceId",
+                self._device_id(),
+                "Privacy-preserving stable identifier derived from machine-id.",
+            ),
+        )
+        for path, name, value, description in identity_values:
+            self._add_point(
+                identity,
+                path,
+                name,
+                value,
+                ua.VariantType.String,
+                description,
+            )
+        self._add_point(
+            identity,
+            "Identity.ModelPublicationDate",
+            "ModelPublicationDate",
+            MODEL_PUBLICATION_DATE,
+            ua.VariantType.DateTime,
+            "Publication date of this OPC UA information model.",
+        )
+        self._add_point(
+            identity,
+            "Identity.ServerStartTime",
+            "ServerStartTime",
+            self._started_at,
+            ua.VariantType.DateTime,
+            "Time this OPC UA server process started.",
+        )
+
+        measurement = self._add_object(
+            root,
+            "Measurement",
+            "Measurement",
+            "Latest impedance calculation and underlying lock-in values.",
+        )
+        self._add_point(
+            measurement,
+            "Measurement.Sequence",
+            "Sequence",
+            0,
+            ua.VariantType.UInt64,
+            "Monotonic sequence assigned to each observed ZMon record.",
+        )
+        self._add_point(
+            measurement,
+            "Measurement.SampleTime",
+            "SampleTime",
+            _MISSING_DATETIME,
+            ua.VariantType.DateTime,
+            "Time the server sampled this measurement from ZMon.",
+        )
+        self._add_point(
+            measurement,
+            "Measurement.ResistanceOhm",
+            "ResistanceOhm",
+            math.nan,
+            ua.VariantType.Double,
+            (
+                "Equivalent resistive impedance at the stimulus frequency. "
+                "This value is available only when ResistanceRange is "
+                "InRange. Above the validated presentation range, the result "
+                "is NaN with BadOutOfRange and the panel displays HIGH Z."
+            ),
+            unit="Ohm",
+        )
+        self._add_point(
+            measurement,
+            "Measurement.ResistanceRange",
+            "ResistanceRange",
+            "Unknown",
+            ua.VariantType.String,
+            "Interpretation of ResistanceOhm: InRange, OutOfRange, or Invalid.",
+        )
+        self._add_point(
+            measurement,
+            "Measurement.CapacitanceNanofarad",
+            "CapacitanceNanofarad",
+            math.nan,
+            ua.VariantType.Double,
+            "Equivalent capacitive component estimated by the calibration.",
+            unit="nF",
+        )
+        self._add_point(
+            measurement,
+            "Measurement.CapacitanceRange",
+            "CapacitanceRange",
+            "Unknown",
+            ua.VariantType.String,
+            "Interpretation of CapacitanceNanofarad.",
+        )
+        self._add_point(
+            measurement,
+            "Measurement.ThresholdOhm",
+            "ThresholdOhm",
+            math.nan,
+            ua.VariantType.Double,
+            "Alarm threshold active in the measurement engine.",
+            unit="Ohm",
+            value_range=(0.0, 1_000_000.0),
+        )
+        self._add_point(
+            measurement,
+            "Measurement.StimulusFrequencyHertz",
+            "StimulusFrequencyHertz",
+            math.nan,
+            ua.VariantType.Double,
+            "Nominal sine-wave stimulus frequency.",
+            unit="Hz",
+        )
+        for path, name, description, unit in (
+            (
+                "Measurement.MagnitudeCount",
+                "MagnitudeCount",
+                "Lock-in magnitude in uncalibrated ADC counts.",
+                None,
+            ),
+            (
+                "Measurement.PhaseAtanDegrees",
+                "PhaseAtanDegrees",
+                "Phase calculated with atan.",
+                "deg",
+            ),
+            (
+                "Measurement.PhaseAtan2Degrees",
+                "PhaseAtan2Degrees",
+                "Phase calculated with atan2.",
+                "deg",
+            ),
+            (
+                "Measurement.PhaseInterpolatedDegrees",
+                "PhaseInterpolatedDegrees",
+                "Phase used by the impedance calibration interpolation.",
+                "deg",
+            ),
+            (
+                "Measurement.InPhaseCount",
+                "InPhaseCount",
+                "Lock-in in-phase component in ADC counts.",
+                None,
+            ),
+            (
+                "Measurement.QuadratureCount",
+                "QuadratureCount",
+                "Lock-in quadrature component in ADC counts.",
+                None,
+            ),
+        ):
+            self._add_point(
+                measurement,
+                path,
+                name,
+                math.nan,
+                ua.VariantType.Double,
+                description,
+                unit=unit,
+            )
+        self._add_point(
+            measurement,
+            "Measurement.AveragesPerCalculation",
+            "AveragesPerCalculation",
+            0,
+            ua.VariantType.UInt32,
+            "Number of measurements averaged in each calculation.",
+        )
+        for path, name, description in (
+            (
+                "Measurement.Quality",
+                "Quality",
+                "Human-readable aggregate quality; use each DataValue StatusCode programmatically.",
+            ),
+            (
+                "Measurement.Diagnostic",
+                "Diagnostic",
+                "Diagnostic explaining degraded or bad measurement quality.",
+            ),
+            (
+                "Measurement.LegacyRecord",
+                "LegacyRecord",
+                "Original comma-delimited ZMon record retained for audit only.",
+            ),
+        ):
+            self._add_point(
+                measurement,
+                path,
+                name,
+                "",
+                ua.VariantType.String,
+                description,
+            )
+
+        alarm = self._add_object(
+            root,
+            "Alarm",
+            "Alarm",
+            "Current threshold/phase alarm state and persistent latch.",
+        )
+        self._add_point(
+            alarm,
+            "Alarm.Latched",
+            "Latched",
+            False,
+            ua.VariantType.Boolean,
+            "True when the persistent GIZMo alarm latch is set.",
+        )
+        self._add_point(
+            alarm,
+            "Alarm.Active",
+            "Active",
+            False,
+            ua.VariantType.Boolean,
+            "True when the current measurement satisfies an alarm condition.",
+        )
+        self._add_point(
+            alarm,
+            "Alarm.Reason",
+            "Reason",
+            "",
+            ua.VariantType.String,
+            "ResistanceThreshold, PhaseInterpolation, HistoricalLatch, or empty.",
+        )
+        self._add_point(
+            alarm,
+            "Alarm.LatchTime",
+            "LatchTime",
+            _MISSING_DATETIME,
+            ua.VariantType.DateTime,
+            "Time recorded when the persistent latch was set.",
+        )
+
+        thermal = self._add_object(
+            root,
+            "Thermal",
+            "Thermal",
+            "Chassis and CPU temperature sensors.",
+        )
+        for key, display in (
+            ("Chassis", "ChassisTemperatureCelsius"),
+            ("CPU1", "Cpu1TemperatureCelsius"),
+            ("CPU2", "Cpu2TemperatureCelsius"),
+            ("CPU3", "Cpu3TemperatureCelsius"),
+        ):
+            self._add_point(
+                thermal,
+                f"Thermal.{key}TemperatureCelsius",
+                display,
+                math.nan,
+                ua.VariantType.Double,
+                f"{key} temperature.",
+                unit="Cel",
+            )
+        self._add_quality_points(thermal, "Thermal")
+
+        clock = self._add_object(
+            root,
+            "Time",
+            "Time",
+            "Linux wall clock, timezone, NTP, uptime, RTC, and clocksource.",
+        )
+        for path, name, default, variant_type, description, unit in (
+            (
+                "Time.CurrentUtc",
+                "CurrentUtc",
+                _MISSING_DATETIME,
+                ua.VariantType.DateTime,
+                "Observed wall-clock time encoded in UTC.",
+                None,
+            ),
+            (
+                "Time.CurrentLocal",
+                "CurrentLocal",
+                "",
+                ua.VariantType.String,
+                "ISO-8601 local time including UTC offset.",
+                None,
+            ),
+            (
+                "Time.BootTime",
+                "BootTime",
+                _MISSING_DATETIME,
+                ua.VariantType.DateTime,
+                "Estimated Linux boot time.",
+                None,
+            ),
+            (
+                "Time.UptimeSeconds",
+                "UptimeSeconds",
+                0.0,
+                ua.VariantType.Double,
+                "Linux uptime.",
+                "s",
+            ),
+            (
+                "Time.MonotonicNanoseconds",
+                "MonotonicNanoseconds",
+                0,
+                ua.VariantType.UInt64,
+                "Python monotonic clock reading.",
+                None,
+            ),
+            (
+                "Time.TimezoneName",
+                "TimezoneName",
+                "",
+                ua.VariantType.String,
+                "Configured IANA timezone name.",
+                None,
+            ),
+            (
+                "Time.UtcOffsetSeconds",
+                "UtcOffsetSeconds",
+                0,
+                ua.VariantType.Int32,
+                "Local UTC offset at CurrentUtc.",
+                "s",
+            ),
+            (
+                "Time.NtpSynchronized",
+                "NtpSynchronized",
+                False,
+                ua.VariantType.Boolean,
+                "True when timedatectl confirms NTP synchronization.",
+                None,
+            ),
+            (
+                "Time.NtpServiceActive",
+                "NtpServiceActive",
+                False,
+                ua.VariantType.Boolean,
+                "True when network time service is enabled.",
+                None,
+            ),
+            (
+                "Time.NtpService",
+                "NtpService",
+                "",
+                ua.VariantType.String,
+                "Source used to determine NTP status.",
+                None,
+            ),
+            (
+                "Time.RtcPresent",
+                "RtcPresent",
+                False,
+                ua.VariantType.Boolean,
+                "True when Linux exposes an RTC device.",
+                None,
+            ),
+            (
+                "Time.RtcDevice",
+                "RtcDevice",
+                "",
+                ua.VariantType.String,
+                "Linux RTC sysfs device path.",
+                None,
+            ),
+            (
+                "Time.CurrentClocksource",
+                "CurrentClocksource",
+                "",
+                ua.VariantType.String,
+                "Kernel clocksource currently selected.",
+                None,
+            ),
+            (
+                "Time.AvailableClocksources",
+                "AvailableClocksources",
+                [],
+                ua.VariantType.String,
+                "Kernel clocksources available for selection.",
+                None,
+            ),
+        ):
+            self._add_point(
+                clock,
+                path,
+                name,
+                default,
+                variant_type,
+                description,
+                unit=unit,
+            )
+        self._add_quality_points(clock, "Time")
+
+        host = self._add_object(
+            root,
+            "OperatingSystem",
+            "OperatingSystem",
+            "Linux identity and resource status.",
+        )
+        for path, name, default, variant_type, description, unit in (
+            (
+                "OperatingSystem.Hostname",
+                "Hostname",
+                "",
+                ua.VariantType.String,
+                "Current Linux hostname.",
+                None,
+            ),
+            (
+                "OperatingSystem.PrettyName",
+                "PrettyName",
+                "",
+                ua.VariantType.String,
+                "Operating-system distribution name.",
+                None,
+            ),
+            (
+                "OperatingSystem.VersionId",
+                "VersionId",
+                "",
+                ua.VariantType.String,
+                "Operating-system distribution version.",
+                None,
+            ),
+            (
+                "OperatingSystem.KernelRelease",
+                "KernelRelease",
+                "",
+                ua.VariantType.String,
+                "Linux kernel release.",
+                None,
+            ),
+            (
+                "OperatingSystem.KernelVersion",
+                "KernelVersion",
+                "",
+                ua.VariantType.String,
+                "Linux kernel build information.",
+                None,
+            ),
+            (
+                "OperatingSystem.Architecture",
+                "Architecture",
+                "",
+                ua.VariantType.String,
+                "Machine architecture.",
+                None,
+            ),
+            (
+                "OperatingSystem.LogicalCpuCount",
+                "LogicalCpuCount",
+                0,
+                ua.VariantType.UInt32,
+                "Number of logical CPUs visible to the runtime.",
+                None,
+            ),
+            (
+                "OperatingSystem.CpuUtilizationPercent",
+                "CpuUtilizationPercent",
+                math.nan,
+                ua.VariantType.Double,
+                "CPU utilization between consecutive samples.",
+                "%",
+            ),
+            (
+                "OperatingSystem.Load1Minute",
+                "Load1Minute",
+                math.nan,
+                ua.VariantType.Double,
+                "One-minute Linux load average.",
+                None,
+            ),
+            (
+                "OperatingSystem.Load5Minute",
+                "Load5Minute",
+                math.nan,
+                ua.VariantType.Double,
+                "Five-minute Linux load average.",
+                None,
+            ),
+            (
+                "OperatingSystem.Load15Minute",
+                "Load15Minute",
+                math.nan,
+                ua.VariantType.Double,
+                "Fifteen-minute Linux load average.",
+                None,
+            ),
+            (
+                "OperatingSystem.MemoryTotalBytes",
+                "MemoryTotalBytes",
+                0,
+                ua.VariantType.UInt64,
+                "Total physical memory.",
+                "byte",
+            ),
+            (
+                "OperatingSystem.MemoryAvailableBytes",
+                "MemoryAvailableBytes",
+                0,
+                ua.VariantType.UInt64,
+                "Memory currently available without swapping.",
+                "byte",
+            ),
+            (
+                "OperatingSystem.MemoryUsedBytes",
+                "MemoryUsedBytes",
+                0,
+                ua.VariantType.UInt64,
+                "Total memory minus available memory.",
+                "byte",
+            ),
+            (
+                "OperatingSystem.SwapTotalBytes",
+                "SwapTotalBytes",
+                0,
+                ua.VariantType.UInt64,
+                "Configured swap capacity.",
+                "byte",
+            ),
+            (
+                "OperatingSystem.SwapFreeBytes",
+                "SwapFreeBytes",
+                0,
+                ua.VariantType.UInt64,
+                "Currently free swap capacity.",
+                "byte",
+            ),
+            (
+                "OperatingSystem.ProcessCount",
+                "ProcessCount",
+                0,
+                ua.VariantType.UInt32,
+                "Number of Linux processes.",
+                None,
+            ),
+            (
+                "OperatingSystem.RunningProcessCount",
+                "RunningProcessCount",
+                0,
+                ua.VariantType.UInt32,
+                "Number of runnable Linux processes.",
+                None,
+            ),
+            (
+                "OperatingSystem.EntropyAvailableBits",
+                "EntropyAvailableBits",
+                0,
+                ua.VariantType.UInt64,
+                "Kernel random-pool entropy estimate.",
+                None,
+            ),
+            (
+                "OperatingSystem.OpenFileHandles",
+                "OpenFileHandles",
+                0,
+                ua.VariantType.UInt64,
+                "Allocated Linux file handles.",
+                None,
+            ),
+        ):
+            self._add_point(
+                host,
+                path,
+                name,
+                default,
+                variant_type,
+                description,
+                unit=unit,
+            )
+        self._add_quality_points(host, "OperatingSystem")
+
+        network = self._add_object(
+            root,
+            "Network",
+            "Network",
+            "Interface identity, addresses, routing, DNS, counters, and MAC provenance.",
+        )
+        self.network_interfaces_object = self._add_object(
+            network,
+            "Network.Interfaces",
+            "Interfaces",
+            "One object per Linux network interface.",
+        )
+        self._add_point(
+            network,
+            "Network.ExpectedInterfaces",
+            "ExpectedInterfaces",
+            [],
+            ua.VariantType.String,
+            "Linux interface names expected on this GIZMo deployment.",
+        )
+        self._add_point(
+            network,
+            "Network.MissingInterfaces",
+            "MissingInterfaces",
+            [],
+            ua.VariantType.String,
+            "Expected Linux interfaces that are currently absent.",
+        )
+        self._add_point(
+            network,
+            "Network.Routes",
+            "Routes",
+            [],
+            ua.VariantType.String,
+            "Kernel routing-table entries in normalized text form.",
+        )
+        self._add_point(
+            network,
+            "Network.DnsServers",
+            "DnsServers",
+            [],
+            ua.VariantType.String,
+            "Configured DNS resolver addresses.",
+        )
+        self._add_point(
+            network,
+            "Network.DomainName",
+            "DomainName",
+            "",
+            ua.VariantType.String,
+            "Configured DNS search/domain name.",
+        )
+        self._add_quality_points(network, "Network")
+
+        storage = self._add_object(
+            root,
+            "Storage",
+            "Storage",
+            "Capacity and health of filesystems used by GIZMo.",
+        )
+        self.storage_filesystems_object = self._add_object(
+            storage,
+            "Storage.Filesystems",
+            "Filesystems",
+            "One object per relevant mounted filesystem.",
+        )
+        self._add_quality_points(storage, "Storage")
+
+        firmware = self._add_object(
+            root,
+            "Firmware",
+            "Firmware",
+            "Runtime, Kria board, FPGA overlay, and expected-device state.",
+        )
+        for path, name, default, variant_type, description in (
+            (
+                "Firmware.RuntimeVersion",
+                "RuntimeVersion",
+                "",
+                ua.VariantType.String,
+                "Installed gizmo-runtime package version.",
+            ),
+            (
+                "Firmware.OverlayName",
+                "OverlayName",
+                "",
+                ua.VariantType.String,
+                "Configured xmutil FPGA application name.",
+            ),
+            (
+                "Firmware.OverlayInstalled",
+                "OverlayInstalled",
+                False,
+                ua.VariantType.Boolean,
+                "True when the overlay files exist under /lib/firmware/Xilinx.",
+            ),
+            (
+                "Firmware.OverlayLoaded",
+                "OverlayLoaded",
+                False,
+                ua.VariantType.Boolean,
+                "True when xmutil confirms the configured application is loaded.",
+            ),
+            (
+                "Firmware.OverlayState",
+                "OverlayState",
+                "",
+                ua.VariantType.String,
+                "Running, Degraded, Missing, or load state unconfirmed.",
+            ),
+            (
+                "Firmware.OverlayPath",
+                "OverlayPath",
+                "",
+                ua.VariantType.String,
+                "Installed FPGA overlay directory.",
+            ),
+            (
+                "Firmware.OverlayBitstreamSha256",
+                "OverlayBitstreamSha256",
+                "",
+                ua.VariantType.String,
+                "SHA-256 digest of the installed FPGA bitstream.",
+            ),
+            (
+                "Firmware.DeviceTreeOverlay",
+                "DeviceTreeOverlay",
+                "",
+                ua.VariantType.String,
+                "Installed device-tree overlay path.",
+            ),
+            (
+                "Firmware.DeviceTreeOverlaySha256",
+                "DeviceTreeOverlaySha256",
+                "",
+                ua.VariantType.String,
+                "SHA-256 digest of the device-tree overlay.",
+            ),
+            (
+                "Firmware.ShellName",
+                "ShellName",
+                "",
+                ua.VariantType.String,
+                "Kria shell type reported by shell.json.",
+            ),
+            (
+                "Firmware.ExpectedDevices",
+                "ExpectedDevices",
+                [],
+                ua.VariantType.String,
+                "Device nodes expected after the overlay loads.",
+            ),
+            (
+                "Firmware.MissingDevices",
+                "MissingDevices",
+                [],
+                ua.VariantType.String,
+                "Expected overlay devices that are currently absent.",
+            ),
+            (
+                "Firmware.BoardModel",
+                "BoardModel",
+                "",
+                ua.VariantType.String,
+                "Device-tree board model.",
+            ),
+            (
+                "Firmware.BoardSerialNumber",
+                "BoardSerialNumber",
+                "",
+                ua.VariantType.String,
+                "Device-tree serial number.",
+            ),
+            (
+                "Firmware.CarrierManufacturer",
+                "CarrierManufacturer",
+                "",
+                ua.VariantType.String,
+                "Carrier manufacturer read through xmutil boardid.",
+            ),
+            (
+                "Firmware.CarrierProductName",
+                "CarrierProductName",
+                "",
+                ua.VariantType.String,
+                "Carrier product name read through xmutil boardid.",
+            ),
+            (
+                "Firmware.CarrierPartNumber",
+                "CarrierPartNumber",
+                "",
+                ua.VariantType.String,
+                "Carrier part number read through xmutil boardid.",
+            ),
+            (
+                "Firmware.CarrierSerialNumber",
+                "CarrierSerialNumber",
+                "",
+                ua.VariantType.String,
+                "Carrier serial number read through xmutil boardid.",
+            ),
+            (
+                "Firmware.CarrierRevision",
+                "CarrierRevision",
+                "",
+                ua.VariantType.String,
+                "Carrier revision read through xmutil boardid.",
+            ),
+            (
+                "Firmware.FactoryMacAddresses",
+                "FactoryMacAddresses",
+                [],
+                ua.VariantType.String,
+                "Factory MAC addresses read from carrier FRU data.",
+            ),
+        ):
+            self._add_point(
+                firmware,
+                path,
+                name,
+                default,
+                variant_type,
+                description,
+            )
+        self._add_quality_points(firmware, "Firmware")
+
+        services = self._add_object(
+            root,
+            "Services",
+            "Services",
+            "State of every systemd unit owned by the GIZMo package.",
+        )
+        self.services_units_object = self._add_object(
+            services,
+            "Services.Units",
+            "Units",
+            "One object per GIZMo systemd unit.",
+        )
+        for unit in (
+            "gizmo.target",
+            "gizmo-network.service",
+            "gizmo-hardware.service",
+            "gizmo-control.socket",
+            "gizmo-control.service",
+            "gizmo-zmon.service",
+            "gizmo-display.service",
+            "gizmo-temperature.service",
+            "gizmo-sdr.service",
+            "gizmo-zmq.service",
+            "gizmo-opcua.service",
+        ):
+            self._ensure_service_points(unit)
+        self._add_quality_points(services, "Services")
+
+        calibration = self._add_object(
+            root,
+            "Calibration",
+            "Calibration",
+            "Installed calibration tables and current calibration configuration.",
+        )
+        for path, name, default, variant_type, description, unit in (
+            (
+                "Calibration.State",
+                "State",
+                "Unknown",
+                ua.VariantType.String,
+                "Valid only when all expected tables contain numeric rows.",
+                None,
+            ),
+            (
+                "Calibration.ConfiguredThresholdOhm",
+                "ConfiguredThresholdOhm",
+                0.0,
+                ua.VariantType.Double,
+                "Threshold persisted in package-owned state.",
+                "Ohm",
+            ),
+            (
+                "Calibration.MeasurementsPerCalculation",
+                "MeasurementsPerCalculation",
+                0,
+                ua.VariantType.UInt32,
+                "Averaging interval persisted in package-owned state.",
+                None,
+            ),
+            (
+                "Calibration.MagnitudeNormalizationPending",
+                "MagnitudeNormalizationPending",
+                False,
+                ua.VariantType.Boolean,
+                "True when magnitude normalization has been requested.",
+                None,
+            ),
+            (
+                "Calibration.LastCalibrationTime",
+                "LastCalibrationTime",
+                _MISSING_DATETIME,
+                ua.VariantType.DateTime,
+                "Newest modification time among the calibration tables.",
+                None,
+            ),
+        ):
+            self._add_point(
+                calibration,
+                path,
+                name,
+                default,
+                variant_type,
+                description,
+                unit=unit,
+            )
+        tables_object = self._add_object(
+            calibration,
+            "Calibration.Tables",
+            "Tables",
+            "Metadata for each calibration table.",
+        )
+        for key in (
+            "Resistance",
+            "ResistancePhase",
+            "Capacitance",
+            "CapacitancePhase",
+        ):
+            self._ensure_calibration_points(tables_object, key)
+        self._add_quality_points(calibration, "Calibration")
+
+        sdr = self._add_object(
+            root,
+            "SDR",
+            "SDR",
+            "Latest raw ADC/SDR frame and stream status.",
+        )
+        for path, name, default, variant_type, description in (
+            (
+                "SDR.Available",
+                "Available",
+                False,
+                ua.VariantType.Boolean,
+                "True when a complete frame was received from the SDR service.",
+            ),
+            (
+                "SDR.Endpoint",
+                "Endpoint",
+                f"tcp://{SDR_HOST}:{SDR_PORT}",
+                ua.VariantType.String,
+                "Internal SDR stream endpoint.",
+            ),
+            (
+                "SDR.SampleFormat",
+                "SampleFormat",
+                "little-endian signed int32",
+                ua.VariantType.String,
+                "Binary representation produced by the SDR service.",
+            ),
+            (
+                "SDR.SamplesPerFrame",
+                "SamplesPerFrame",
+                SDR_SAMPLE_COUNT,
+                ua.VariantType.UInt32,
+                "Configured sample count in each complete frame.",
+            ),
+            (
+                "SDR.FrameSequence",
+                "FrameSequence",
+                0,
+                ua.VariantType.UInt64,
+                "Monotonic sequence assigned to each complete SDR frame.",
+            ),
+            (
+                "SDR.SampleTime",
+                "SampleTime",
+                _MISSING_DATETIME,
+                ua.VariantType.DateTime,
+                "Time the server received the complete SDR frame.",
+            ),
+            (
+                "SDR.LatestFrame",
+                "LatestFrame",
+                [],
+                ua.VariantType.Int32,
+                "Complete signed Int32 SDR frame; subscriptions should use a suitable interval.",
+            ),
+        ):
+            self._add_point(
+                sdr,
+                path,
+                name,
+                default,
+                variant_type,
+                description,
+            )
+        self._add_quality_points(sdr, "SDR")
+
+        configuration = self._add_object(
+            root,
+            "Configuration",
+            "Configuration",
+            "Validated operator configuration forwarded to the measurement engine.",
+        )
+        threshold = read_exported_int("setThreshold.env", "threshold", 100)
+        interval = read_exported_int("setRunInterval.env", "runInterval", 100)
+        self.configuration_threshold = self._add_point(
+            configuration,
+            "Configuration.ThresholdOhm",
+            "ThresholdOhm",
+            threshold,
+            ua.VariantType.UInt32,
+            "Writable integer alarm threshold from 0 through 1,000,000 ohm.",
+            unit="Ohm",
+            value_range=(0.0, 1_000_000.0),
+            writable=True,
+        )
+        self.configuration_interval = self._add_point(
+            configuration,
+            "Configuration.AveragesPerCalculation",
+            "AveragesPerCalculation",
+            interval,
+            ua.VariantType.UInt32,
+            "Writable averaging count; accepted values are 1 through 1,000,000.",
+            writable=True,
+        )
+        self._add_point(
+            configuration,
+            "Configuration.LastCommandResult",
+            "LastCommandResult",
+            "",
+            ua.VariantType.String,
+            "Result of the most recent canonical configuration write or method call.",
+        )
+
+        operations = self._add_object(
+            root,
+            "Operations",
+            "Operations",
+            "Explicit operations replacing legacy magic writable variables.",
+        )
+        self._add_method(
+            operations,
+            "Operations.ClearLatch",
+            "ClearLatch",
+            self.clear_latch_method,
+            [],
+            "Clear the persistent alarm latch.",
+        )
+        self._add_method(
+            operations,
+            "Operations.StartCalibration",
+            "StartCalibration",
+            self.start_calibration_method,
+            [ua.VariantType.UInt32],
+            "Restart ZMon in calibration mode with the requested reads per point.",
+        )
+        self._add_method(
+            operations,
+            "Operations.CaptureAdc",
+            "CaptureAdc",
+            self.capture_adc_method,
+            [],
+            "Request a raw ADC capture; read Legacy/CommandObject/csvData when complete.",
+        )
+        self._add_method(
+            operations,
+            "Operations.NormalizeMagnitude",
+            "NormalizeMagnitude",
+            self.normalize_magnitude_method,
+            [],
+            "Set the one-shot magnitude-normalization flag.",
+        )
+        self._add_method(
+            operations,
+            "Operations.SetSystemTime",
+            "SetSystemTime",
+            self.set_system_time_method,
+            [ua.VariantType.DateTime],
+            "Set the Linux wall clock from an absolute OPC UA DateTime.",
+        )
+
+        health = self._add_object(
+            root,
+            "Health",
+            "Health",
+            "Aggregate availability of every monitored subsystem.",
+        )
+        self._add_point(
+            health,
+            "Health.Overall",
+            "Overall",
+            "Starting",
+            ua.VariantType.String,
+            "OK, Degraded, Failed, or Starting.",
+        )
+        self._add_point(
+            health,
+            "Health.LastUpdate",
+            "LastUpdate",
+            _MISSING_DATETIME,
+            ua.VariantType.DateTime,
+            "Time aggregate health was last evaluated.",
+        )
+        for category in (
+            "Measurement",
+            "Thermal",
+            "Time",
+            "OperatingSystem",
+            "Network",
+            "Storage",
+            "Firmware",
+            "Services",
+            "Calibration",
+            "SDR",
+        ):
+            self._add_point(
+                health,
+                f"Health.{category}",
+                category,
+                "Starting",
+                ua.VariantType.String,
+                f"Aggregate quality of the {category} subtree.",
+            )
+
+    def _add_quality_points(self, parent: object, prefix: str) -> None:
+        self._add_point(
+            parent,
+            f"{prefix}.Quality",
+            "Quality",
+            QUALITY_NOT_AVAILABLE,
+            ua.VariantType.String,
+            "Human-readable aggregate quality; inspect DataValue StatusCode for machine use.",
+        )
+        self._add_point(
+            parent,
+            f"{prefix}.Diagnostic",
+            "Diagnostic",
+            "",
+            ua.VariantType.String,
+            "Diagnostic explaining degraded or bad quality.",
+        )
+        self._add_point(
+            parent,
+            f"{prefix}.LastUpdate",
+            "LastUpdate",
+            _MISSING_DATETIME,
+            ua.VariantType.DateTime,
+            "Source timestamp of the latest completed update.",
+        )
+
+    @staticmethod
+    def _read_text(path: str | Path) -> str:
+        try:
+            return Path(path).read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            return ""
+
+    def _device_id(self) -> str:
+        machine_id = self._read_text("/etc/machine-id") or socket.gethostname()
+        return hashlib.sha256(f"gov.fnal.gizmo:{machine_id}".encode()).hexdigest()[:32]
+
+    def _ensure_interface_points(self, name: str) -> dict[str, str]:
+        if name in self._interface_points:
+            return self._interface_points[name]
+        key = self._safe_identifier(name)
+        base = f"Network.Interfaces.{key}"
+        obj = self._add_object(
+            self.network_interfaces_object,
+            base,
+            name,
+            f"Linux network interface {name}.",
+        )
+        definitions = (
+            ("Name", name, ua.VariantType.String, "Linux interface name.", None),
+            (
+                "Present",
+                False,
+                ua.VariantType.Boolean,
+                "True when the interface exists in the current inventory.",
+                None,
+            ),
+            ("Index", 0, ua.VariantType.UInt32, "Linux interface index.", None),
+            (
+                "MacAddress",
+                "",
+                ua.VariantType.String,
+                "Current link-layer address.",
+                None,
+            ),
+            (
+                "PermanentMacAddress",
+                "",
+                ua.VariantType.String,
+                "Permanent address reported by the driver when available.",
+                None,
+            ),
+            (
+                "MacAssignmentCode",
+                -1,
+                ua.VariantType.Int32,
+                "Linux addr_assign_type: 0 permanent, 1 random, 2 stolen, 3 software set.",
+                None,
+            ),
+            (
+                "MacAddressSource",
+                "",
+                ua.VariantType.String,
+                "Observed MAC provenance; FRU EEPROM is only reported when verified against xmutil boardid.",
+                None,
+            ),
+            (
+                "AdministrativeUp",
+                False,
+                ua.VariantType.Boolean,
+                "True when the interface UP flag is set.",
+                None,
+            ),
+            (
+                "Carrier",
+                False,
+                ua.VariantType.Boolean,
+                "Physical link carrier state.",
+                None,
+            ),
+            (
+                "OperationalState",
+                "",
+                ua.VariantType.String,
+                "Linux operational state.",
+                None,
+            ),
+            ("Mtu", 0, ua.VariantType.UInt32, "Interface MTU.", None),
+            (
+                "SpeedMegabitPerSecond",
+                0,
+                ua.VariantType.UInt32,
+                "Negotiated link speed.",
+                "Mbit/s",
+            ),
+            (
+                "Duplex",
+                "",
+                ua.VariantType.String,
+                "Negotiated duplex mode.",
+                None,
+            ),
+            (
+                "Driver",
+                "",
+                ua.VariantType.String,
+                "Bound Linux network driver.",
+                None,
+            ),
+            (
+                "Addresses",
+                [],
+                ua.VariantType.String,
+                "Assigned IP addresses with prefix, family, scope, and flags.",
+                None,
+            ),
+            ("RxBytes", 0, ua.VariantType.UInt64, "Received bytes.", "byte"),
+            ("RxPackets", 0, ua.VariantType.UInt64, "Received packets.", None),
+            ("RxErrors", 0, ua.VariantType.UInt64, "Receive errors.", None),
+            ("RxDropped", 0, ua.VariantType.UInt64, "Dropped receive packets.", None),
+            ("TxBytes", 0, ua.VariantType.UInt64, "Transmitted bytes.", "byte"),
+            ("TxPackets", 0, ua.VariantType.UInt64, "Transmitted packets.", None),
+            ("TxErrors", 0, ua.VariantType.UInt64, "Transmit errors.", None),
+            ("TxDropped", 0, ua.VariantType.UInt64, "Dropped transmit packets.", None),
+            ("Collisions", 0, ua.VariantType.UInt64, "Link collisions.", None),
+        )
+        points: dict[str, str] = {}
+        for field_name, default, variant_type, description, unit in definitions:
+            path = f"{base}.{field_name}"
+            self._add_point(
+                obj,
+                path,
+                field_name,
+                default,
+                variant_type,
+                description,
+                unit=unit,
+            )
+            points[field_name] = path
+        self._interface_points[name] = points
+        return points
+
+    def _ensure_filesystem_points(self, key: str) -> dict[str, str]:
+        if key in self._filesystem_points:
+            return self._filesystem_points[key]
+        safe_key = self._safe_identifier(key)
+        base = f"Storage.Filesystems.{safe_key}"
+        obj = self._add_object(
+            self.storage_filesystems_object,
+            base,
+            key,
+            f"Filesystem serving the GIZMo {key.lower()} path.",
+        )
+        definitions = (
+            ("MountPoint", "", ua.VariantType.String, "Mount point.", None),
+            ("Source", "", ua.VariantType.String, "Filesystem source.", None),
+            ("Type", "", ua.VariantType.String, "Filesystem type.", None),
+            ("TotalBytes", 0, ua.VariantType.UInt64, "Total capacity.", "byte"),
+            ("UsedBytes", 0, ua.VariantType.UInt64, "Used capacity.", "byte"),
+            (
+                "AvailableBytes",
+                0,
+                ua.VariantType.UInt64,
+                "Capacity available to this service.",
+                "byte",
+            ),
+            (
+                "UsedPercent",
+                0.0,
+                ua.VariantType.Double,
+                "Percentage of total capacity in use.",
+                "%",
+            ),
+            (
+                "ReadOnly",
+                False,
+                ua.VariantType.Boolean,
+                "True when mounted read-only.",
+                None,
+            ),
+            ("Quality", "", ua.VariantType.String, "Filesystem quality.", None),
+        )
+        points: dict[str, str] = {}
+        for field_name, default, variant_type, description, unit in definitions:
+            path = f"{base}.{field_name}"
+            self._add_point(
+                obj,
+                path,
+                field_name,
+                default,
+                variant_type,
+                description,
+                unit=unit,
+            )
+            points[field_name] = path
+        self._filesystem_points[key] = points
+        return points
+
+    def _ensure_service_points(self, unit: str) -> dict[str, str]:
+        if unit in self._service_points:
+            return self._service_points[unit]
+        key = self._safe_identifier(unit)
+        base = f"Services.Units.{key}"
+        obj = self._add_object(
+            self.services_units_object,
+            base,
+            unit,
+            f"systemd state for {unit}.",
+        )
+        definitions = (
+            ("Unit", unit, ua.VariantType.String, "systemd unit name."),
+            ("Description", "", ua.VariantType.String, "systemd description."),
+            ("LoadState", "", ua.VariantType.String, "systemd load state."),
+            ("ActiveState", "", ua.VariantType.String, "systemd active state."),
+            ("SubState", "", ua.VariantType.String, "systemd sub-state."),
+            ("Result", "", ua.VariantType.String, "Last systemd result."),
+            ("MainPid", 0, ua.VariantType.UInt32, "Current main process ID."),
+            ("RestartCount", 0, ua.VariantType.UInt32, "Automatic restart count."),
+            ("ExitStatus", 0, ua.VariantType.Int32, "Last main-process exit status."),
+            (
+                "ActiveSince",
+                _MISSING_DATETIME,
+                ua.VariantType.DateTime,
+                "Time the unit entered active state.",
+            ),
+            ("StatusText", "", ua.VariantType.String, "Current systemd status text."),
+            (
+                "Required",
+                False,
+                ua.VariantType.Boolean,
+                "True when gizmo.target treats this unit as required.",
+            ),
+            ("Quality", "", ua.VariantType.String, "Unit quality."),
+        )
+        points: dict[str, str] = {}
+        for field_name, default, variant_type, description in definitions:
+            path = f"{base}.{field_name}"
+            self._add_point(
+                obj,
+                path,
+                field_name,
+                default,
+                variant_type,
+                description,
+            )
+            points[field_name] = path
+        self._service_points[unit] = points
+        return points
+
+    def _ensure_calibration_points(self, parent: object, key: str) -> dict[str, str]:
+        if key in self._calibration_points:
+            return self._calibration_points[key]
+        safe_key = self._safe_identifier(key)
+        base = f"Calibration.Tables.{safe_key}"
+        obj = self._add_object(
+            parent,
+            base,
+            key,
+            f"Metadata for the {key} calibration table.",
+        )
+        definitions = (
+            ("Kind", key, ua.VariantType.String, "Calibration-table kind."),
+            ("Path", "", ua.VariantType.String, "Package-owned mutable table path."),
+            ("State", "Unknown", ua.VariantType.String, "Valid, Invalid, or Missing."),
+            ("Sha256", "", ua.VariantType.String, "SHA-256 table digest."),
+            (
+                "ModifiedTime",
+                _MISSING_DATETIME,
+                ua.VariantType.DateTime,
+                "Table modification time.",
+            ),
+            ("RowCount", 0, ua.VariantType.UInt32, "Number of numeric input rows."),
+            ("InputMinimum", math.nan, ua.VariantType.Double, "Minimum input value."),
+            ("InputMaximum", math.nan, ua.VariantType.Double, "Maximum input value."),
+            ("InputUnit", "", ua.VariantType.String, "Unit of the first table column."),
+            ("Format", "", ua.VariantType.String, "Expected CSV column format."),
+        )
+        points: dict[str, str] = {}
+        for field_name, default, variant_type, description in definitions:
+            path = f"{base}.{field_name}"
+            self._add_point(
+                obj,
+                path,
+                field_name,
+                default,
+                variant_type,
+                description,
+            )
+            points[field_name] = path
+        self._calibration_points[key] = points
+        return points
+
+    @staticmethod
+    def _quality_status(quality: str) -> int:
+        if quality == QUALITY_GOOD:
+            return ua.StatusCodes.Good
+        if quality == QUALITY_UNCERTAIN:
+            return ua.StatusCodes.UncertainLastUsableValue
+        if quality == QUALITY_NOT_AVAILABLE:
+            return ua.StatusCodes.BadNoCommunication
+        return ua.StatusCodes.BadDataUnavailable
+
+    def _update(
+        self,
+        path: str,
+        value: object,
+        quality: str = QUALITY_GOOD,
+        source_time: dt.datetime | None = None,
+        *,
+        status_code: int | None = None,
+    ) -> None:
+        node, variant_type, default = self._points[path]
+        if value is None:
+            value = default
+            if quality == QUALITY_GOOD:
+                quality = QUALITY_NOT_AVAILABLE
+        stamp = source_time or utc_now()
+        if stamp.tzinfo is not None:
+            stamp = stamp.astimezone(dt.timezone.utc)
+        data_value = ua.DataValue(
+            ua.Variant(value, variant_type),
+            ua.StatusCode(
+                status_code
+                if status_code is not None
+                else self._quality_status(quality)
+            ),
+            sourceTimestamp=stamp,
+        )
+        node.set_data_value(data_value)
+
+    def _mark_initial_values(self) -> None:
+        live_prefixes = (
+            "Measurement.",
+            "Alarm.",
+            "Thermal.",
+            "Time.",
+            "OperatingSystem.",
+            "Network.",
+            "Storage.",
+            "Firmware.",
+            "Services.",
+            "Calibration.",
+            "SDR.",
+            "Health.",
+        )
+        stamp = utc_now()
+        for path, (node, variant_type, default) in self._points.items():
+            if path.startswith(live_prefixes):
+                node.set_data_value(
+                    ua.DataValue(
+                        ua.Variant(default, variant_type),
+                        ua.StatusCode(ua.StatusCodes.BadWaitingForInitialData),
+                        sourceTimestamp=stamp,
+                    )
+                )
+
+    def _mark_prefix_failed(self, prefix: str, error: BaseException) -> None:
+        quality = (
+            QUALITY_UNCERTAIN if prefix in self._has_data else QUALITY_NOT_AVAILABLE
+        )
+        status = (
+            ua.StatusCodes.UncertainLastUsableValue
+            if prefix in self._has_data
+            else ua.StatusCodes.BadNoCommunication
+        )
+        stamp = utc_now()
+        for path, (node, variant_type, _) in self._points.items():
+            if not path.startswith(f"{prefix}."):
+                continue
+            try:
+                current = node.get_attributes([ua.AttributeIds.Value])[0].Value.Value
+                node.set_data_value(
+                    ua.DataValue(
+                        ua.Variant(current, variant_type),
+                        ua.StatusCode(status),
+                        sourceTimestamp=stamp,
+                    )
+                )
+            except (ValueError, RuntimeError):
+                continue
+        quality_path = f"{prefix}.Quality"
+        diagnostic_path = f"{prefix}.Diagnostic"
+        update_path = f"{prefix}.LastUpdate"
+        if quality_path in self._points:
+            self._update(quality_path, quality, QUALITY_GOOD, stamp)
+        if diagnostic_path in self._points:
+            self._update(diagnostic_path, str(error), QUALITY_GOOD, stamp)
+        if update_path in self._points:
+            self._update(update_path, stamp, QUALITY_GOOD, stamp)
+        self._category_quality[prefix] = quality
+        self._update_health()
 
     def request(self, command: str) -> str:
-        """Use a request-local ZMQ socket so OPC callback threads never share one."""
+        """Use a request-local socket so OPC callback threads never share one."""
         with self._request_lock:
             client = self._context.socket(zmq.REQ)
             client.setsockopt(zmq.LINGER, 0)
@@ -94,11 +1885,58 @@ class GizmoOpcUaServer:
             finally:
                 client.close()
 
-    def send_command(self, parent: object, command: object) -> list[ua.Variant]:
+    @staticmethod
+    def _method_value(value: object) -> object:
+        return getattr(value, "Value", value)
+
+    def _command_result(self, result: str) -> list[ua.Variant]:
+        self._update("Configuration.LastCommandResult", result, QUALITY_GOOD, utc_now())
+        return [ua.Variant(result, ua.VariantType.String)]
+
+    def send_legacy_command(self, parent: object, command: object) -> list[ua.Variant]:
         del parent
-        value = getattr(command, "Value", command)
-        reply = self.request(str(value))
+        reply = self.request(str(self._method_value(command)))
         return [ua.Variant(reply, ua.VariantType.String)]
+
+    def clear_latch_method(self, parent: object) -> list[ua.Variant]:
+        del parent
+        return self._command_result(self.request("clear_latch"))
+
+    def start_calibration_method(
+        self, parent: object, reads_per_point: object
+    ) -> list[ua.Variant]:
+        del parent
+        reads = int(self._method_value(reads_per_point))
+        if reads < 1 or reads > 1_000_000:
+            raise ValueError("reads_per_point must be between 1 and 1000000")
+        return self._command_result(self.request(f"CAL {reads}"))
+
+    def capture_adc_method(self, parent: object) -> list[ua.Variant]:
+        del parent
+        result = self.request("read_adc")
+        self._adc_ready_at = time.monotonic() + 5
+        return self._command_result(result)
+
+    def normalize_magnitude_method(self, parent: object) -> list[ua.Variant]:
+        del parent
+        atomic_write(state_path("normalizeMagFlag.env"), "normalizeMagFlag=1\n")
+        return self._command_result("Magnitude normalization requested")
+
+    def set_system_time_method(
+        self, parent: object, requested_time: object
+    ) -> list[ua.Variant]:
+        del parent
+        requested = self._method_value(requested_time)
+        if not isinstance(requested, dt.datetime):
+            raise ValueError("requested_time must be an OPC UA DateTime")
+        if requested.tzinfo is None:
+            requested = requested.replace(tzinfo=dt.timezone.utc)
+        epoch_seconds = int(requested.timestamp())
+        if epoch_seconds < 946_684_800 or epoch_seconds > 4_102_444_800:
+            raise ValueError("requested_time must be between 2000 and 2100")
+        result = self.request(f"set_time_epoch {epoch_seconds}")
+        self._next_run["Time"] = 0.0
+        return self._command_result(result)
 
     @staticmethod
     def csv_as_text(name: str) -> str:
@@ -108,87 +1946,715 @@ class GizmoOpcUaServer:
         except OSError as error:
             return f"Unable to read {name}: {error}"
 
-    @staticmethod
-    def read_temperature() -> str:
-        with socket.create_connection((TEMPERATURE_HOST, TEMPERATURE_PORT), timeout=3) as client:
-            return client.recv(1024).decode("utf-8", errors="replace").strip()
+    def _collect_measurement(self) -> tuple[str, MeasurementSnapshot]:
+        raw = self.request("get_data")
+        self._measurement_sequence += 1
+        snapshot = parse_legacy_measurement(
+            raw,
+            sequence=self._measurement_sequence,
+            averages_per_calculation=read_exported_int(
+                "setRunInterval.env", "runInterval", 100
+            ),
+        )
+        return raw, snapshot
 
     @staticmethod
-    def read_sdr() -> list[int]:
+    def _collect_thermal() -> tuple[str, ThermalSnapshot]:
+        raw = bytearray()
+        with socket.create_connection(
+            (TEMPERATURE_HOST, TEMPERATURE_PORT), timeout=3
+        ) as client:
+            client.settimeout(3)
+            while len(raw) < 4096 and b"\n" not in raw:
+                chunk = client.recv(1024)
+                if not chunk:
+                    break
+                raw.extend(chunk)
+        if not raw:
+            raise ConnectionError("temperature service closed without data")
+        record = raw.decode("utf-8", errors="replace").strip()
+        return record, parse_legacy_thermals(record)
+
+    @staticmethod
+    def _collect_sdr() -> tuple[dt.datetime, list[int]]:
         frame_size = SDR_SAMPLE_COUNT * 4
         raw = bytearray(frame_size)
         view = memoryview(raw)
         received = 0
         with socket.create_connection((SDR_HOST, SDR_PORT), timeout=3) as client:
+            client.settimeout(3)
             while received < frame_size:
                 count = client.recv_into(view[received:], frame_size - received)
                 if count == 0:
                     raise ConnectionError("SDR service closed before a complete frame")
                 received += count
-        return np.frombuffer(raw, dtype=np.int32).tolist()
+        return utc_now(), np.frombuffer(raw, dtype="<i4").tolist()
 
-    def poll_readbacks(self) -> None:
-        self.data.set_value(self.request("get_data"))
-        self.thermals.set_value(self.read_temperature())
-        self.resistance_calibration.set_value(self.csv_as_text("Rcalibration_ph.csv"))
-        self.capacitance_calibration.set_value(self.csv_as_text("Ccalibration_ph.csv"))
-        self.sdr.set_value(ua.Variant(self.read_sdr(), ua.VariantType.Int32))
+    def _apply_measurement(self, result: tuple[str, MeasurementSnapshot]) -> None:
+        raw, snapshot = result
+        stamp = snapshot.sampled_at
+        self.legacy_data.set_value(raw)
+        self._update("Measurement.Sequence", snapshot.sequence, snapshot.quality, stamp)
+        self._update("Measurement.SampleTime", stamp, snapshot.quality, stamp)
+        resistance_quality = (
+            QUALITY_NOT_AVAILABLE if snapshot.resistance_ohm is None else QUALITY_GOOD
+        )
+        resistance_status = (
+            ua.StatusCodes.BadOutOfRange
+            if snapshot.resistance_range == RANGE_OUT_OF_RANGE
+            else None
+        )
+        self._update(
+            "Measurement.ResistanceOhm",
+            snapshot.resistance_ohm,
+            resistance_quality,
+            stamp,
+            status_code=resistance_status,
+        )
+        self._update(
+            "Measurement.ResistanceRange",
+            snapshot.resistance_range,
+            snapshot.quality,
+            stamp,
+        )
+        self._update(
+            "Measurement.CapacitanceNanofarad",
+            snapshot.capacitance_nf,
+            (
+                QUALITY_GOOD
+                if snapshot.capacitance_nf is not None
+                else QUALITY_NOT_AVAILABLE
+            ),
+            stamp,
+        )
+        self._update(
+            "Measurement.CapacitanceRange",
+            snapshot.capacitance_range,
+            snapshot.quality,
+            stamp,
+        )
+        for path, value in (
+            ("Measurement.ThresholdOhm", snapshot.threshold_ohm),
+            (
+                "Measurement.StimulusFrequencyHertz",
+                snapshot.stimulus_frequency_hz,
+            ),
+            ("Measurement.MagnitudeCount", snapshot.magnitude_count),
+            ("Measurement.PhaseAtanDegrees", snapshot.phase_atan_deg),
+            ("Measurement.PhaseAtan2Degrees", snapshot.phase_atan2_deg),
+            (
+                "Measurement.PhaseInterpolatedDegrees",
+                snapshot.phase_interpolated_deg,
+            ),
+            ("Measurement.InPhaseCount", snapshot.in_phase_count),
+            ("Measurement.QuadratureCount", snapshot.quadrature_count),
+        ):
+            self._update(path, value, snapshot.quality, stamp)
+        self._update(
+            "Measurement.AveragesPerCalculation",
+            snapshot.averages_per_calculation,
+            snapshot.quality,
+            stamp,
+        )
+        self._update("Measurement.Quality", snapshot.quality, QUALITY_GOOD, stamp)
+        self._update(
+            "Measurement.Diagnostic",
+            snapshot.diagnostic,
+            QUALITY_GOOD,
+            stamp,
+        )
+        self._update(
+            "Measurement.LegacyRecord",
+            snapshot.raw_record,
+            snapshot.quality,
+            stamp,
+        )
+        alarm_active = bool(snapshot.alarm_reason) and (
+            snapshot.alarm_reason != "HistoricalLatch"
+        )
+        self._update("Alarm.Latched", snapshot.alarm_latched, snapshot.quality, stamp)
+        self._update("Alarm.Active", alarm_active, snapshot.quality, stamp)
+        self._update("Alarm.Reason", snapshot.alarm_reason, snapshot.quality, stamp)
+        self._update(
+            "Alarm.LatchTime",
+            snapshot.latch_time,
+            (
+                snapshot.quality
+                if snapshot.latch_time is not None
+                else QUALITY_NOT_AVAILABLE
+            ),
+            stamp,
+        )
+        self._has_data.add("Measurement")
+        self._category_quality["Measurement"] = snapshot.quality
+        self._update_health()
 
-    def forward_writes(self) -> None:
-        threshold = self.set_threshold.get_value()
-        if threshold != self._last_threshold:
-            print(self.request(f"set_th {threshold}"), flush=True)
-            self._last_threshold = threshold
+    def _apply_thermal(self, result: tuple[str, ThermalSnapshot]) -> None:
+        raw, snapshot = result
+        self.legacy_thermals.set_value(raw)
+        for key, value in snapshot.sensors_celsius.items():
+            self._update(
+                f"Thermal.{key}TemperatureCelsius",
+                value,
+                QUALITY_GOOD if value is not None else QUALITY_NOT_AVAILABLE,
+                snapshot.sampled_at,
+            )
+        self._apply_quality(
+            "Thermal", snapshot.quality, snapshot.diagnostic, snapshot.sampled_at
+        )
 
-        requested_time = self.set_time.get_value()
+    def _apply_time(self, snapshot: TimeSnapshot) -> None:
+        stamp = snapshot.observed_at
+        local_time = stamp.astimezone().isoformat(timespec="seconds")
+        for path, value in (
+            ("Time.CurrentUtc", stamp),
+            ("Time.CurrentLocal", local_time),
+            ("Time.BootTime", snapshot.boot_time),
+            ("Time.UptimeSeconds", snapshot.uptime_seconds),
+            ("Time.MonotonicNanoseconds", snapshot.monotonic_ns),
+            ("Time.TimezoneName", snapshot.timezone_name),
+            ("Time.UtcOffsetSeconds", snapshot.utc_offset_seconds),
+            ("Time.NtpSynchronized", snapshot.ntp_synchronized),
+            ("Time.NtpServiceActive", snapshot.ntp_service_active),
+            ("Time.NtpService", snapshot.ntp_service),
+            ("Time.RtcPresent", snapshot.rtc_present),
+            ("Time.RtcDevice", snapshot.rtc_device),
+            ("Time.CurrentClocksource", snapshot.current_clocksource),
+            ("Time.AvailableClocksources", snapshot.available_clocksources),
+        ):
+            self._update(path, value, snapshot.quality, stamp)
+        self._apply_quality("Time", snapshot.quality, snapshot.diagnostic, stamp)
+
+    def _apply_host(self, snapshot: HostSnapshot) -> None:
+        stamp = snapshot.observed_at
+        for path, value in (
+            ("OperatingSystem.Hostname", snapshot.hostname),
+            ("OperatingSystem.PrettyName", snapshot.os_pretty_name),
+            ("OperatingSystem.VersionId", snapshot.os_version_id),
+            ("OperatingSystem.KernelRelease", snapshot.kernel_release),
+            ("OperatingSystem.KernelVersion", snapshot.kernel_version),
+            ("OperatingSystem.Architecture", snapshot.architecture),
+            ("OperatingSystem.LogicalCpuCount", snapshot.logical_cpu_count),
+            (
+                "OperatingSystem.CpuUtilizationPercent",
+                snapshot.cpu_utilization_percent,
+            ),
+            ("OperatingSystem.Load1Minute", snapshot.load_1m),
+            ("OperatingSystem.Load5Minute", snapshot.load_5m),
+            ("OperatingSystem.Load15Minute", snapshot.load_15m),
+            ("OperatingSystem.MemoryTotalBytes", snapshot.memory_total_bytes),
+            (
+                "OperatingSystem.MemoryAvailableBytes",
+                snapshot.memory_available_bytes,
+            ),
+            ("OperatingSystem.MemoryUsedBytes", snapshot.memory_used_bytes),
+            ("OperatingSystem.SwapTotalBytes", snapshot.swap_total_bytes),
+            ("OperatingSystem.SwapFreeBytes", snapshot.swap_free_bytes),
+            ("OperatingSystem.ProcessCount", snapshot.process_count),
+            (
+                "OperatingSystem.RunningProcessCount",
+                snapshot.running_process_count,
+            ),
+            (
+                "OperatingSystem.EntropyAvailableBits",
+                snapshot.entropy_available_bits,
+            ),
+            (
+                "OperatingSystem.OpenFileHandles",
+                snapshot.open_file_handles,
+            ),
+        ):
+            self._update(path, value, snapshot.quality, stamp)
+        self._apply_quality(
+            "OperatingSystem", snapshot.quality, snapshot.diagnostic, stamp
+        )
+
+    def _apply_network(self, snapshot: NetworkSnapshot) -> None:
+        stamp = snapshot.observed_at
+        observed_names = {interface.name for interface in snapshot.interfaces}
+        for name, points in self._interface_points.items():
+            if name not in observed_names:
+                self._update(points["Present"], False, QUALITY_UNCERTAIN, stamp)
+        for interface in snapshot.interfaces:
+            points = self._ensure_interface_points(interface.name)
+            values = {
+                "Name": interface.name,
+                "Present": True,
+                "Index": interface.index,
+                "MacAddress": interface.mac_address,
+                "PermanentMacAddress": interface.permanent_mac_address,
+                "MacAssignmentCode": interface.mac_assignment_code,
+                "MacAddressSource": interface.mac_address_source,
+                "AdministrativeUp": interface.administrative_up,
+                "Carrier": interface.carrier,
+                "OperationalState": interface.operational_state,
+                "Mtu": interface.mtu,
+                "SpeedMegabitPerSecond": interface.speed_mbps,
+                "Duplex": interface.duplex,
+                "Driver": interface.driver,
+                "Addresses": interface.addresses,
+                "RxBytes": interface.rx_bytes,
+                "RxPackets": interface.rx_packets,
+                "RxErrors": interface.rx_errors,
+                "RxDropped": interface.rx_dropped,
+                "TxBytes": interface.tx_bytes,
+                "TxPackets": interface.tx_packets,
+                "TxErrors": interface.tx_errors,
+                "TxDropped": interface.tx_dropped,
+                "Collisions": interface.collisions,
+            }
+            for field, value in values.items():
+                self._update(points[field], value, snapshot.quality, stamp)
+        self._update(
+            "Network.ExpectedInterfaces",
+            snapshot.expected_interfaces,
+            QUALITY_GOOD,
+            stamp,
+        )
+        self._update(
+            "Network.MissingInterfaces",
+            snapshot.missing_interfaces,
+            QUALITY_GOOD,
+            stamp,
+        )
+        self._update("Network.Routes", snapshot.routes, snapshot.quality, stamp)
+        self._update(
+            "Network.DnsServers", snapshot.dns_servers, snapshot.quality, stamp
+        )
+        self._update(
+            "Network.DomainName", snapshot.domain_name, snapshot.quality, stamp
+        )
+        self._apply_quality("Network", snapshot.quality, snapshot.diagnostic, stamp)
+
+    def _apply_storage(self, snapshot: StorageSnapshot) -> None:
+        stamp = snapshot.observed_at
+        for filesystem in snapshot.filesystems:
+            points = self._ensure_filesystem_points(filesystem.key)
+            values = {
+                "MountPoint": filesystem.mount_point,
+                "Source": filesystem.source,
+                "Type": filesystem.filesystem_type,
+                "TotalBytes": filesystem.total_bytes,
+                "UsedBytes": filesystem.used_bytes,
+                "AvailableBytes": filesystem.available_bytes,
+                "UsedPercent": filesystem.used_percent,
+                "ReadOnly": filesystem.read_only,
+                "Quality": filesystem.quality,
+            }
+            for field, value in values.items():
+                self._update(points[field], value, filesystem.quality, stamp)
+        self._apply_quality("Storage", snapshot.quality, snapshot.diagnostic, stamp)
+
+    def _apply_firmware(self, snapshot: FirmwareSnapshot) -> None:
+        stamp = snapshot.observed_at
+        for path, value in (
+            ("Firmware.RuntimeVersion", snapshot.runtime_version),
+            ("Firmware.OverlayName", snapshot.overlay_name),
+            ("Firmware.OverlayInstalled", snapshot.overlay_installed),
+            ("Firmware.OverlayLoaded", snapshot.overlay_loaded),
+            ("Firmware.OverlayState", snapshot.overlay_state),
+            ("Firmware.OverlayPath", snapshot.overlay_path),
+            (
+                "Firmware.OverlayBitstreamSha256",
+                snapshot.overlay_bitstream_sha256,
+            ),
+            ("Firmware.DeviceTreeOverlay", snapshot.device_tree_overlay),
+            (
+                "Firmware.DeviceTreeOverlaySha256",
+                snapshot.device_tree_overlay_sha256,
+            ),
+            ("Firmware.ShellName", snapshot.shell_name),
+            ("Firmware.ExpectedDevices", snapshot.expected_devices),
+            ("Firmware.MissingDevices", snapshot.missing_devices),
+            ("Firmware.BoardModel", snapshot.board_model),
+            ("Firmware.BoardSerialNumber", snapshot.board_serial_number),
+            ("Firmware.CarrierManufacturer", snapshot.carrier_manufacturer),
+            ("Firmware.CarrierProductName", snapshot.carrier_product_name),
+            ("Firmware.CarrierPartNumber", snapshot.carrier_part_number),
+            ("Firmware.CarrierSerialNumber", snapshot.carrier_serial_number),
+            ("Firmware.CarrierRevision", snapshot.carrier_revision),
+            (
+                "Firmware.FactoryMacAddresses",
+                snapshot.factory_mac_addresses,
+            ),
+        ):
+            self._update(path, value, snapshot.quality, stamp)
+        self._apply_quality("Firmware", snapshot.quality, snapshot.diagnostic, stamp)
+
+    def _apply_services(self, snapshot: ServiceInventorySnapshot) -> None:
+        stamp = snapshot.observed_at
+        for service in snapshot.services:
+            points = self._ensure_service_points(service.unit)
+            values = {
+                "Unit": service.unit,
+                "Description": service.description,
+                "LoadState": service.load_state,
+                "ActiveState": service.active_state,
+                "SubState": service.sub_state,
+                "Result": service.result,
+                "MainPid": service.main_pid,
+                "RestartCount": service.restart_count,
+                "ExitStatus": service.exit_status,
+                "ActiveSince": service.active_since,
+                "StatusText": service.status_text,
+                "Required": service.required,
+                "Quality": service.quality,
+            }
+            for field, value in values.items():
+                self._update(points[field], value, service.quality, stamp)
+        self._apply_quality("Services", snapshot.quality, snapshot.diagnostic, stamp)
+
+    def _apply_calibration(self, snapshot: CalibrationSnapshot) -> None:
+        stamp = snapshot.observed_at
+        for path, value in (
+            ("Calibration.State", snapshot.state),
+            (
+                "Calibration.ConfiguredThresholdOhm",
+                snapshot.configured_threshold_ohm,
+            ),
+            (
+                "Calibration.MeasurementsPerCalculation",
+                snapshot.measurements_per_calculation,
+            ),
+            (
+                "Calibration.MagnitudeNormalizationPending",
+                snapshot.magnitude_normalization_pending,
+            ),
+            ("Calibration.LastCalibrationTime", snapshot.last_calibration_at),
+        ):
+            self._update(path, value, snapshot.quality, stamp)
+        self.legacy_resistance_calibration.set_value(
+            self.csv_as_text("Rcalibration_ph.csv")
+        )
+        self.legacy_capacitance_calibration.set_value(
+            self.csv_as_text("Ccalibration_ph.csv")
+        )
+        for table in snapshot.tables:
+            points = self._calibration_points[table.key]
+            quality = QUALITY_GOOD if table.state == "Valid" else QUALITY_BAD
+            values = {
+                "Kind": table.kind,
+                "Path": table.path,
+                "State": table.state,
+                "Sha256": table.sha256,
+                "ModifiedTime": table.modified_at,
+                "RowCount": table.row_count,
+                "InputMinimum": table.input_min,
+                "InputMaximum": table.input_max,
+                "InputUnit": table.input_unit,
+                "Format": table.format,
+            }
+            for field, value in values.items():
+                self._update(points[field], value, quality, stamp)
+        self._apply_quality("Calibration", snapshot.quality, snapshot.diagnostic, stamp)
+
+    def _apply_sdr(self, result: tuple[dt.datetime, list[int]]) -> None:
+        stamp, frame = result
+        self._sdr_sequence += 1
+        self.legacy_sdr.set_value(ua.Variant(frame, ua.VariantType.Int32))
+        for path, value in (
+            ("SDR.Available", True),
+            ("SDR.FrameSequence", self._sdr_sequence),
+            ("SDR.SampleTime", stamp),
+            ("SDR.LatestFrame", frame),
+        ):
+            self._update(path, value, QUALITY_GOOD, stamp)
+        self._apply_quality("SDR", QUALITY_GOOD, "", stamp)
+
+    def _apply_quality(
+        self, prefix: str, quality: str, diagnostic: str, stamp: dt.datetime
+    ) -> None:
+        self._update(f"{prefix}.Quality", quality, QUALITY_GOOD, stamp)
+        self._update(f"{prefix}.Diagnostic", diagnostic, QUALITY_GOOD, stamp)
+        self._update(f"{prefix}.LastUpdate", stamp, QUALITY_GOOD, stamp)
+        self._has_data.add(prefix)
+        self._category_quality[prefix] = quality
+        self._update_health()
+
+    def _update_health(self) -> None:
+        categories = (
+            "Measurement",
+            "Thermal",
+            "Time",
+            "OperatingSystem",
+            "Network",
+            "Storage",
+            "Firmware",
+            "Services",
+            "Calibration",
+            "SDR",
+        )
+        essential = {
+            "Measurement",
+            "Time",
+            "Firmware",
+            "Services",
+            "Calibration",
+        }
+        states = {
+            category: self._category_quality.get(category, QUALITY_NOT_AVAILABLE)
+            for category in categories
+        }
+        if self._attempted < set(categories):
+            overall = "Starting"
+        elif any(
+            states[category] in {QUALITY_BAD, QUALITY_NOT_AVAILABLE}
+            for category in essential
+        ):
+            overall = "Failed"
+        elif any(value != QUALITY_GOOD for value in states.values()):
+            overall = "Degraded"
+        else:
+            overall = "OK"
+        stamp = utc_now()
+        for category, quality in states.items():
+            self._update(
+                f"Health.{category}",
+                quality if category in self._attempted else "Starting",
+                QUALITY_GOOD,
+                stamp,
+            )
+        self._update("Health.Overall", overall, QUALITY_GOOD, stamp)
+        self._update("Health.LastUpdate", stamp, QUALITY_GOOD, stamp)
+        if self._ready_sent and overall != self._last_notified_health:
+            notify_systemd(f"STATUS=Canonical OPC UA namespace ready; {overall}")
+            self._last_notified_health = overall
+
+    def _job_specs(
+        self,
+    ) -> dict[str, tuple[float, Callable[[], object], Callable[[object], None]]]:
+        return {
+            "Measurement": (
+                MEASUREMENT_INTERVAL,
+                self._collect_measurement,
+                self._apply_measurement,
+            ),
+            "Thermal": (
+                MEASUREMENT_INTERVAL,
+                self._collect_thermal,
+                self._apply_thermal,
+            ),
+            "SDR": (SDR_INTERVAL, self._collect_sdr, self._apply_sdr),
+            "Time": (
+                MEASUREMENT_INTERVAL,
+                self._collectors.collect_time,
+                self._apply_time,
+            ),
+            "OperatingSystem": (
+                PLATFORM_INTERVAL,
+                self._collectors.collect_host,
+                self._apply_host,
+            ),
+            "Network": (
+                PLATFORM_INTERVAL,
+                self._collectors.collect_network,
+                self._apply_network,
+            ),
+            "Storage": (
+                INVENTORY_INTERVAL,
+                self._collectors.collect_storage,
+                self._apply_storage,
+            ),
+            "Firmware": (
+                INVENTORY_INTERVAL,
+                self._collectors.collect_firmware,
+                self._apply_firmware,
+            ),
+            "Services": (
+                PLATFORM_INTERVAL,
+                self._collectors.collect_services,
+                self._apply_services,
+            ),
+            "Calibration": (
+                INVENTORY_INTERVAL,
+                self._collectors.collect_calibration,
+                self._apply_calibration,
+            ),
+        }
+
+    def _schedule_jobs(self, now: float) -> None:
+        for name, (interval, collector, _) in self._job_specs().items():
+            if name in self._jobs:
+                continue
+            if now < self._next_run.get(name, 0.0):
+                continue
+            self._jobs[name] = self._executor.submit(collector)
+            self._next_run[name] = now + max(0.1, interval)
+
+    def _finish_jobs(self) -> None:
+        specs = self._job_specs()
+        for name, future in list(self._jobs.items()):
+            if not future.done():
+                continue
+            del self._jobs[name]
+            self._attempted.add(name)
+            try:
+                result = future.result()
+                specs[name][2](result)
+            except Exception as error:  # noqa: BLE001 - isolate collector failures
+                print(f"{name} collection failed: {error}", flush=True)
+                self._mark_prefix_failed(name, error)
+
+    def _forward_configuration_writes(self) -> None:
+        requested_thresholds = (
+            int(self.configuration_threshold.get_value()),
+            int(self.legacy_threshold.get_value()),
+        )
+        requested_threshold = next(
+            (value for value in requested_thresholds if value != self._last_threshold),
+            self._last_threshold,
+        )
+        if requested_threshold != self._last_threshold:
+            if not 0 <= requested_threshold <= 1_000_000:
+                self.configuration_threshold.set_value(self._last_threshold)
+                self.legacy_threshold.set_value(self._last_threshold)
+                raise ValueError("threshold must be between 0 and 1000000")
+            try:
+                result = self.request(f"set_th {requested_threshold}")
+            except (OSError, RuntimeError, zmq.ZMQError):
+                self.configuration_threshold.set_value(self._last_threshold)
+                self.legacy_threshold.set_value(self._last_threshold)
+                raise
+            self._last_threshold = requested_threshold
+            self.configuration_threshold.set_value(requested_threshold)
+            self.legacy_threshold.set_value(requested_threshold)
+            self._update(
+                "Configuration.LastCommandResult",
+                result,
+                QUALITY_GOOD,
+                utc_now(),
+            )
+
+        requested_intervals = (
+            int(self.configuration_interval.get_value()),
+            int(self.legacy_measurements.get_value()),
+        )
+        requested_interval = next(
+            (
+                value
+                for value in requested_intervals
+                if value != self._last_run_interval
+            ),
+            self._last_run_interval,
+        )
+        if requested_interval != self._last_run_interval:
+            if not 1 <= requested_interval <= 1_000_000:
+                self.configuration_interval.set_value(self._last_run_interval)
+                self.legacy_measurements.set_value(self._last_run_interval)
+                raise ValueError(
+                    "averages per calculation must be between 1 and 1000000"
+                )
+            try:
+                result = self.request(f"run {requested_interval}")
+            except (OSError, RuntimeError, zmq.ZMQError):
+                self.configuration_interval.set_value(self._last_run_interval)
+                self.legacy_measurements.set_value(self._last_run_interval)
+                raise
+            self._last_run_interval = requested_interval
+            self.configuration_interval.set_value(requested_interval)
+            self.legacy_measurements.set_value(requested_interval)
+            self._update(
+                "Configuration.LastCommandResult",
+                result,
+                QUALITY_GOOD,
+                utc_now(),
+            )
+
+        requested_time = self.legacy_set_time.get_value()
         if requested_time != self._last_time:
-            print(self.request(f"set_time {requested_time}"), flush=True)
+            try:
+                result = self.request(f"set_time {requested_time}")
+            except (OSError, RuntimeError, zmq.ZMQError):
+                self.legacy_set_time.set_value(self._last_time)
+                raise
+            print(result, flush=True)
             self._last_time = requested_time
 
-        if self.clear_latch.get_value() == "clear_latch":
+        if self.legacy_clear_latch.get_value() == "clear_latch":
+            self.legacy_clear_latch.set_value("")
             print(self.request("clear_latch"), flush=True)
-            self.clear_latch.set_value("")
 
-        run_interval = self.measurements.get_value()
-        if run_interval != self._last_run_interval:
-            print(self.request(f"run {run_interval}"), flush=True)
-            self._last_run_interval = run_interval
+        if self.legacy_calibrate.get_value() == 1:
+            self.legacy_calibrate.set_value(0)
+            print(self.request(f"CAL {self._last_run_interval}"), flush=True)
 
-        if self.calibrate.get_value() == 1:
-            self.calibrate.set_value(0)
-            print(self.request(f"CAL {run_interval}"), flush=True)
-
-        if self.read_adc.get_value() == 1:
-            self.read_adc.set_value(0)
-            self.csv_data.set_value("")
+        if self.legacy_read_adc.get_value() == 1:
+            self.legacy_read_adc.set_value(0)
+            self.legacy_csv_data.set_value("")
             print(self.request("read_adc"), flush=True)
-            time.sleep(5)
-            self.csv_data.set_value(self.csv_as_text("adc.csv"))
+            self._adc_ready_at = time.monotonic() + 5
 
-        if self.normalize.get_value() == 1:
-            atomic_write(state_path("normalizeMagFlag.env"), "normalizeMagFlag=1\n")
-            self.normalize.set_value(0)
+        if self.legacy_normalize.get_value() == 1:
+            atomic_write(
+                state_path("normalizeMagFlag.env"),
+                "normalizeMagFlag=1\n",
+            )
+            self.legacy_normalize.set_value(0)
+
+    def _finish_adc_capture(self, now: float) -> None:
+        if self._adc_ready_at is not None and now >= self._adc_ready_at:
+            self.legacy_csv_data.set_value(self.csv_as_text("adc.csv"))
+            self._adc_ready_at = None
+
+    def stop(self, signum: int, frame: object) -> None:
+        del signum, frame
+        self._running = False
 
     def run(self) -> None:
+        signal.signal(signal.SIGTERM, self.stop)
+        signal.signal(signal.SIGINT, self.stop)
         self.server.start()
-        print(f"OPC-UA server listening at {ENDPOINT}", flush=True)
-        last_poll = 0.0
+        print(
+            f"GIZMo OPC UA server listening at {ENDPOINT}; "
+            f"canonical namespace {MODEL_NAMESPACE_URI}",
+            flush=True,
+        )
+        notify_systemd(
+            f"STATUS=OPC UA listening at {ENDPOINT}; assembling initial state"
+        )
+        last_watchdog = 0.0
+        specs = self._job_specs()
         try:
-            while True:
+            while self._running:
                 now = time.monotonic()
-                if now - last_poll >= 1.0:
-                    try:
-                        self.poll_readbacks()
-                    except (OSError, ConnectionError, zmq.ZMQError) as error:
-                        print(f"Readback poll failed: {error}", flush=True)
-                    last_poll = now
-
+                self._finish_jobs()
+                self._schedule_jobs(now)
+                self._finish_adc_capture(now)
                 try:
-                    self.forward_writes()
-                except (OSError, RuntimeError, ValueError, zmq.ZMQError) as error:
-                    print(f"OPC write forwarding failed: {error}", flush=True)
+                    self._forward_configuration_writes()
+                except (
+                    OSError,
+                    RuntimeError,
+                    TypeError,
+                    ValueError,
+                    zmq.ZMQError,
+                ) as error:
+                    print(f"OPC UA write forwarding failed: {error}", flush=True)
+                    self._update(
+                        "Configuration.LastCommandResult",
+                        f"Command failed: {error}",
+                        QUALITY_BAD,
+                        utc_now(),
+                    )
+
+                if not self._ready_sent and self._attempted >= set(specs):
+                    overall = self._points["Health.Overall"][0].get_value()
+                    notify_systemd(
+                        "READY=1",
+                        (
+                            "STATUS=Canonical OPC UA namespace ready; "
+                            f"{overall}"
+                        ),
+                    )
+                    self._ready_sent = True
+                    self._last_notified_health = str(overall)
+                if now - last_watchdog >= 5:
+                    notify_systemd("WATCHDOG=1")
+                    last_watchdog = now
                 time.sleep(0.05)
         finally:
+            notify_systemd("STOPPING=1", "STATUS=Stopping GIZMo OPC UA server")
+            self._executor.shutdown(wait=False, cancel_futures=True)
             self.server.stop()
 
 

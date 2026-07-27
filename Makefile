@@ -48,8 +48,10 @@ install: all
 	install -D -m 0755 scripts/gizmo-hardware-setup $(DESTDIR)$(PREFIX)/libexec/gizmo/gizmo-hardware-setup
 	install -D -m 0755 scripts/gizmo-network-setup $(DESTDIR)$(PREFIX)/libexec/gizmo/gizmo-network-setup
 	install -D -m 0755 scripts/gizmo-doctor $(DESTDIR)$(PREFIX)/bin/gizmo-doctor
+	install -D -m 0755 scripts/gizmo-opcua-client $(DESTDIR)$(PREFIX)/bin/gizmo-opcua-client
 	install -d -m 0755 $(DESTDIR)$(PREFIX)/libexec/gizmo
 	install -m 0644 src/python/*.py $(DESTDIR)$(PREFIX)/libexec/gizmo/
+	install -D -m 0644 VERSION $(DESTDIR)$(PREFIX)/share/gizmo/VERSION
 	install -d -m 0755 $(DESTDIR)/etc/gizmo
 	install -m 0644 config/hardware.env config/network.env config/runtime.env $(DESTDIR)/etc/gizmo/
 	install -d -m 0755 $(DESTDIR)$(PREFIX)/share/gizmo/default-state
@@ -73,7 +75,7 @@ install: all
 	install -m 0644 $(EVE_ROOT)/example/LICENSE $(DESTDIR)$(PREFIX)/share/doc/gizmo-runtime/licenses/BRIDGETEK-EXAMPLE-LICENSE
 
 test: all
-	./tests/run-tests.sh
+	PYTHON="$(PYTHON)" ./tests/run-tests.sh
 
 deb:
 	./packaging/build-deb.sh

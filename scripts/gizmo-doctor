@@ -19,13 +19,26 @@ check "FPGA overlay definition" test -r /lib/firmware/xilinx/GIZMo_Kria_3_7_25/s
 check "raw memory device" test -r /dev/mem
 check "display SPI device" test -e /dev/spidev3.0
 check "temperature I2C device" test -e /dev/i2c-7
-check "ZeroMQ Python module" python3 -c 'import zmq'
-check "SMBus Python module" python3 -c 'import smbus2'
-check "NumPy Python module" python3 -c 'import numpy'
-check "OPC-UA Python module" python3 -c 'import opcua'
+check "ZeroMQ Python module" env \
+    PYTHONPATH=/usr/lib/gizmo/python:/usr/libexec/gizmo \
+    PYTHONNOUSERSITE=1 python3 -c 'import zmq'
+check "SMBus Python module" env \
+    PYTHONPATH=/usr/lib/gizmo/python:/usr/libexec/gizmo \
+    PYTHONNOUSERSITE=1 python3 -c 'import smbus2'
+check "NumPy Python module" env \
+    PYTHONPATH=/usr/lib/gizmo/python:/usr/libexec/gizmo \
+    PYTHONNOUSERSITE=1 python3 -c 'import numpy'
+check "OPC-UA Python module" env \
+    PYTHONPATH=/usr/lib/gizmo/python:/usr/libexec/gizmo \
+    PYTHONNOUSERSITE=1 python3 -c 'import opcua'
+check "OPC UA operator client" test -x /usr/bin/gizmo-opcua-client
 check "gizmo.target installed" systemctl cat gizmo.target
+check "gizmo-opcua.service installed" systemctl cat gizmo-opcua.service
 
 if systemctl is-active --quiet gizmo.target; then
+    check "canonical OPC UA namespace" env \
+        PYTHONPATH=/usr/lib/gizmo/python:/usr/libexec/gizmo \
+        PYTHONNOUSERSITE=1 gizmo-opcua-client --timeout 3 health
     printf '\nActive services:\n'
     systemctl --no-pager --plain list-dependencies gizmo.target
 else

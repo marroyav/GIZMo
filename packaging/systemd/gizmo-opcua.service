@@ -1,27 +1,48 @@
 [Unit]
-Description=GIZMo OPC-UA bridge
-Requires=gizmo-zmq.service gizmo-temperature.service gizmo-sdr.service
-After=gizmo-zmq.service gizmo-temperature.service gizmo-sdr.service
+Description=GIZMo canonical OPC UA server
+Documentation=file:/usr/share/doc/gizmo-runtime/opcua.md
+Wants=gizmo-zmq.service gizmo-temperature.service gizmo-sdr.service
+After=gizmo-network.service gizmo-zmq.service gizmo-temperature.service gizmo-sdr.service
 PartOf=gizmo.target
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
 User=gizmo
 Group=gizmo
-UMask=0002
+UMask=0077
 Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
 EnvironmentFile=/etc/gizmo/runtime.env
 ExecStart=/usr/bin/python3 /usr/libexec/gizmo/gizmo_opcua.py
 Restart=on-failure
-RestartSec=3
+RestartSec=2
+TimeoutStartSec=90
+TimeoutStopSec=10
+WatchdogSec=30
+
 NoNewPrivileges=yes
+CapabilityBoundingSet=
+PrivateDevices=yes
+PrivateTmp=yes
 ProtectSystem=strict
 ReadWritePaths=/var/lib/gizmo
 ProtectHome=yes
-PrivateTmp=yes
-RestrictAddressFamilies=AF_INET AF_INET6
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
 MemoryDenyWriteExecute=yes
 LockPersonality=yes
+SystemCallArchitectures=native
+TasksMax=96
+LimitNOFILE=4096
 
 [Install]
 WantedBy=gizmo.target
