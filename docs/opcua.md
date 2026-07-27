@@ -89,8 +89,10 @@ Descriptions are AddressSpace attributes and can be browsed by generic clients.
 presentation range, or the recovered calculation's non-numeric sentinel,
 produces `ResistanceRange = OutOfRange`; `ResistanceOhm` is `NaN` with
 `BadOutOfRange`. The packaged client renders that `NaN` as JSON `null`, and
-the front panel displays `HIGH Z`. No numeric resistance or lower bound should
-be inferred in this state.
+the front panel displays `HIGH Z`. No precise numeric resistance should be
+inferred in this state. The dashboard represents it as an explicitly clipped
+`>500 Ω` trace at the validated-range boundary; that display coordinate is not
+written back into `ResistanceOhm`.
 
 `Measurement.LegacyRecord` remains available for audit and compatibility. It
 can contain implementation sentinels from the recovered engine, but it is not

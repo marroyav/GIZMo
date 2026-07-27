@@ -19,7 +19,7 @@ Copy the backup off the instrument.
 ## 2. Install without activating
 
 ```sh
-sudo dpkg -i gizmo-runtime_0.3.0_arm64.deb
+sudo dpkg -i gizmo-runtime_0.3.1_arm64.deb
 sudo gizmo-doctor
 ```
 

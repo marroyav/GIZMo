@@ -149,6 +149,7 @@ class DashboardHttpTests(unittest.TestCase):
 
         self.assertEqual(catalog["namespace_uri"], "urn:fnal:gizmo")
         self.assertGreater(len(catalog["variables"]), 100)
+        self.assertEqual(catalog["resistance_high_z_floor_ohm"], 500)
         self.assertTrue(health["opcua_connected"])
 
     def test_mutating_http_request_is_rejected(self) -> None:

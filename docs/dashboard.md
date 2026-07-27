@@ -72,6 +72,13 @@ The standard views cover impedance, temperatures, lock-in components, phase,
 and system utilization. Other chartable scalars can be selected from the
 variable explorer.
 
+When `Measurement.ResistanceRange = OutOfRange`, the impedance plot adds an
+electric-blue `HIGH Z (>500 Ω)` trace at the 500 Ω validated-range boundary.
+This is a clipped visual state, not a fabricated 500 Ω measurement:
+`ResistanceOhm` remains unavailable with `BadOutOfRange`, and the impedance
+CSV exports the canonical range and its status code rather than replacing the
+missing resistance value with 500.
+
 ## Read-only HTTP interface
 
 The same-origin browser API is deliberately small:
