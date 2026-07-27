@@ -30,6 +30,9 @@ DEFAULT_BIND = "0.0.0.0"
 DEFAULT_PORT = 8080
 DEFAULT_PUBLISH_INTERVAL = 1.0
 MAX_SSE_CLIENTS = 24
+HIGH_Z_FLOOR_OHM = float(
+    os.environ.get("GIZMO_RESISTANCE_VALID_MAX_OHM", "500")
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -975,6 +978,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             "variables": [item.public() for item in VARIABLES],
             "views": CHART_VIEWS,
             "service_units": list(SERVICE_UNITS),
+            "resistance_high_z_floor_ohm": HIGH_Z_FLOOR_OHM,
         }
 
     def _stream(self) -> None:

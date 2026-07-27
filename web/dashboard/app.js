@@ -9,10 +9,13 @@
     "#d14f52",
     "#1f9bb3",
   ];
+  const HIGH_Z_COLOR = "#1868d5";
+  const THRESHOLD_COLOR = "#7d8883";
+  const HIGH_Z_SERIES_PATH = "__display.high_z_floor__";
   const MAX_HISTORY_SECONDS = 3600;
   const MAX_EVENTS = 24;
   const VIEW_COPY = {
-    impedance: "Equivalent resistance and configured threshold",
+    impedance: "Equivalent resistance, HIGH Z floor, and configured threshold",
     thermal: "Chassis and processor thermal sensors",
     lockin: "Lock-in magnitude and orthogonal components",
     phase: "Recovered phase estimates from the measurement pipeline",
@@ -103,6 +106,7 @@
     transitions: new Map(),
     hoverTime: null,
     drawPending: false,
+    highZFloorOhm: 500,
   };
 
   function element(tag, className, text) {
@@ -331,7 +335,7 @@
         : formatNumber(resistance, 1);
     dom.resistanceUnit.textContent = highZ ? "" : "Ω";
     dom.measurementStatus.textContent = highZ
-      ? "Above the validated 500 Ω measurement range"
+      ? `Above the validated ${formatNumber(state.highZFloorOhm, 0)} Ω measurement range`
       : diagnostic || `Sample ${raw("Measurement.Sequence") ?? "—"} · ${relativeTime(raw("Measurement.SampleTime"))}`;
     setChip(dom.measurementQuality, quality);
     dom.thresholdValue.textContent =
@@ -652,6 +656,10 @@
       };
     });
     state.samples.push({ time: timestamp, values });
+    const rangePayload = snapshot.values?.["Measurement.ResistanceRange"];
+    state.samples.at(-1).resistanceRange = rangePayload?.value || null;
+    state.samples.at(-1).resistanceRangeStatus =
+      rangePayload?.status || "BadWaitingForInitialData";
     state.lastSampleAt = timestamp;
     state.lastSampleSequence = snapshot.sequence;
     const cutoff = timestamp - MAX_HISTORY_SECONDS * 1000;
@@ -695,6 +703,57 @@
     });
   }
 
+  function seriesForView(view, samples) {
+    const series = view.paths.map((path, index) => ({
+      path,
+      spec: state.specs.get(path),
+      color:
+        view.id === "impedance" && path.includes("Threshold")
+          ? THRESHOLD_COLOR
+          : COLORS[index % COLORS.length],
+      points: samples.map((sample) => ({
+        time: sample.time,
+        value: sample.values[path]?.value,
+        status: sample.values[path]?.status,
+      })),
+    }));
+    if (
+      view.id === "impedance" &&
+      samples.some((sample) => sample.resistanceRange === "OutOfRange")
+    ) {
+      series.splice(1, 0, {
+        path: HIGH_Z_SERIES_PATH,
+        spec: {
+          label: "HIGH Z",
+          unit: "Ω",
+          precision: 0,
+        },
+        color: HIGH_Z_COLOR,
+        highZ: true,
+        lineWidth: 2.6,
+        points: samples.map((sample) => ({
+          time: sample.time,
+          value:
+            sample.resistanceRange === "OutOfRange"
+              ? state.highZFloorOhm
+              : null,
+          status: sample.resistanceRangeStatus,
+        })),
+      });
+    }
+    return series;
+  }
+
+  function formatSeriesValue(item, point) {
+    if (!point || point.value === null || !plotStatusIsUsable(point.status)) {
+      return "—";
+    }
+    if (item.highZ) return `> ${formatNumber(state.highZFloorOhm, 0)} Ω`;
+    return `${formatNumber(point.value, item.spec?.precision ?? 1)}${
+      item.spec?.unit ? ` ${item.spec.unit}` : ""
+    }`;
+  }
+
   function drawChart() {
     const view = activeView();
     if (!view) return;
@@ -714,16 +773,7 @@
     const latest = state.samples.at(-1)?.time || Date.now();
     const start = latest - state.windowSeconds * 1000;
     const samples = state.samples.filter((sample) => sample.time >= start);
-    const series = view.paths.map((path, index) => ({
-      path,
-      spec: state.specs.get(path),
-      color: COLORS[index % COLORS.length],
-      points: samples.map((sample) => ({
-        time: sample.time,
-        value: sample.values[path]?.value,
-        status: sample.values[path]?.status,
-      })),
-    }));
+    const series = seriesForView(view, samples);
     const numeric = series.flatMap((item) =>
       item.points
         .filter((point) => point.value !== null && plotStatusIsUsable(point.status))
@@ -793,7 +843,7 @@
 
     series.forEach((item, index) => {
       context.strokeStyle = item.color;
-      context.lineWidth = index === 0 ? 2.2 : 1.7;
+      context.lineWidth = item.lineWidth || (index === 0 ? 2.2 : 1.7);
       context.lineJoin = "round";
       context.lineCap = "round";
       context.setLineDash(item.path.includes("Threshold") ? [6, 5] : []);
@@ -825,6 +875,19 @@
       context.setLineDash([]);
     });
 
+    const highZSeries = series.find((item) => item.highZ);
+    if (highZSeries) {
+      const highZY = y(state.highZFloorOhm);
+      context.fillStyle = HIGH_Z_COLOR;
+      context.font = "700 10px ui-monospace, SFMono-Regular, Consolas, monospace";
+      context.textAlign = "right";
+      context.fillText(
+        formatNumber(state.highZFloorOhm, 0),
+        padding.left - 9,
+        highZY,
+      );
+    }
+
     if (state.hoverTime !== null) {
       const hoverX = x(state.hoverTime);
       if (hoverX >= padding.left && hoverX <= width - padding.right) {
@@ -849,9 +912,7 @@
       const latest = [...item.points]
         .reverse()
         .find((point) => point.value !== null && plotStatusIsUsable(point.status));
-      const value = latest
-        ? `${formatNumber(latest.value, item.spec?.precision ?? 1)}${item.spec?.unit ? ` ${item.spec.unit}` : ""}`
-        : "—";
+      const value = formatSeriesValue(item, latest);
       container.append(
         swatch,
         element("span", "", item.spec?.label || item.path),
@@ -860,9 +921,12 @@
       return container;
     });
     dom.chartLegend.replaceChildren(...nodes);
+    const highZNote = series.some((item) => item.highZ)
+      ? ` · HIGH Z clipped to ${formatNumber(state.highZFloorOhm, 0)} Ω`
+      : "";
     dom.plotState.textContent = state.paused
-      ? `Plot paused · ${state.samples.length} samples retained`
-      : `Live · ${state.samples.length} samples retained in this browser`;
+      ? `Plot paused · ${state.samples.length} samples retained${highZNote}`
+      : `Live · ${state.samples.length} samples retained in this browser${highZNote}`;
   }
 
   function showTooltip(event) {
@@ -885,18 +949,23 @@
 
     const content = document.createDocumentFragment();
     content.append(element("time", "", formatDateTime(candidate.time)));
-    view.paths.forEach((path, index) => {
-      const spec = state.specs.get(path);
-      const payload = candidate.values[path];
+    const visibleSamples = state.samples.filter((sample) => sample.time >= start);
+    seriesForView(view, visibleSamples).forEach((item) => {
+      const payload = item.highZ
+        ? {
+            value:
+              candidate.resistanceRange === "OutOfRange"
+                ? state.highZFloorOhm
+                : null,
+            status: candidate.resistanceRangeStatus,
+          }
+        : candidate.values[item.path];
       const row = element("div", "tooltip-row");
       const label = element("span");
       const dot = element("i");
-      dot.style.backgroundColor = COLORS[index % COLORS.length];
-      label.append(dot, document.createTextNode(spec?.label || path));
-      const rendered = payload?.value === null || payload?.value === undefined
-        ? "—"
-        : `${formatNumber(payload.value, spec?.precision ?? 1)}${spec?.unit ? ` ${spec.unit}` : ""}`;
-      row.append(label, element("strong", "", rendered));
+      dot.style.backgroundColor = item.color;
+      label.append(dot, document.createTextNode(item.spec?.label || item.path));
+      row.append(label, element("strong", "", formatSeriesValue(item, payload)));
       content.append(row);
     });
     dom.chartTooltip.replaceChildren(content);
@@ -917,6 +986,7 @@
   function exportCsv() {
     const view = activeView();
     if (!view) return;
+    const includeResistanceRange = view.id === "impedance";
     const latest = state.samples.at(-1)?.time || Date.now();
     const cutoff = latest - state.windowSeconds * 1000;
     const rows = state.samples
@@ -924,12 +994,20 @@
       .map((sample) => [
         new Date(sample.time).toISOString(),
         ...view.paths.map((path) => sample.values[path]?.value ?? ""),
+        ...(includeResistanceRange ? [sample.resistanceRange ?? ""] : []),
         ...view.paths.map((path) => sample.values[path]?.status ?? ""),
+        ...(includeResistanceRange
+          ? [sample.resistanceRangeStatus ?? ""]
+          : []),
       ]);
     const headers = [
       "timestamp_utc",
       ...view.paths,
+      ...(includeResistanceRange ? ["Measurement.ResistanceRange"] : []),
       ...view.paths.map((path) => `${path}.StatusCode`),
+      ...(includeResistanceRange
+        ? ["Measurement.ResistanceRange.StatusCode"]
+        : []),
     ];
     const csv = [headers, ...rows]
       .map((row) =>
@@ -984,6 +1062,8 @@
     state.specs = new Map(state.catalog.map((spec) => [spec.path, spec]));
     state.views = catalog.views;
     state.serviceUnits = catalog.service_units;
+    state.highZFloorOhm =
+      Number(catalog.resistance_high_z_floor_ohm) || 500;
     buildVariableTable();
     buildChartTabs();
     renderChartHeading();

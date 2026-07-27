@@ -9,8 +9,9 @@ network, impedance monitor, display, ZeroMQ, temperature, SDR, OPC UA, and
 live-dashboard components. Systemd owns startup ordering, privileges, restarts,
 logs, and shutdown. Operators still start and stop the product as one unit.
 
-> Status: runtime 0.3.0 is the maintained package. Its predecessor, 0.2.9, was
-> installed and cold-boot tested on the borrowed instrument on 27 July 2026.
+> Status: runtime 0.3.1 is the maintained package. Runtime 0.3.0 was installed
+> and live-tested, and runtime 0.2.9 was installed and cold-boot tested, on the
+> borrowed instrument on 27 July 2026.
 > Installation itself does not enable or start `gizmo.target`.
 
 ## Runtime map
@@ -96,7 +97,7 @@ Read [the migration procedure](docs/migration.md) before touching a running
 legacy image. The safe high-level sequence is:
 
 ```sh
-sudo dpkg -i build/gizmo-runtime_0.3.0_arm64.deb
+sudo dpkg -i build/gizmo-runtime_0.3.1_arm64.deb
 sudo gizmo-doctor
 ```
 
