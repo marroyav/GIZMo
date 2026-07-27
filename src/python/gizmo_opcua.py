@@ -1189,6 +1189,7 @@ class GizmoOpcUaServer:
             "gizmo-sdr.service",
             "gizmo-zmq.service",
             "gizmo-opcua.service",
+            "gizmo-dashboard.service",
         ):
             self._ensure_service_points(unit)
         self._add_quality_points(services, "Services")

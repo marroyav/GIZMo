@@ -124,6 +124,10 @@ gizmo-opcua-client set-time 2026-07-27T09:15:00-06:00
 
 Generic OPC UA clients can browse or subscribe without this utility.
 
+The packaged [live web dashboard](dashboard.md) is another read-only client.
+It creates one subscription for the instrument and fans its cached state out
+to local browsers; browser count does not create additional OPC UA sessions.
+
 `SetSystemTime` accepts an absolute OPC UA `DateTime`; the packaged client
 requires an ISO-8601 UTC offset (or trailing `Z`) to avoid timezone ambiguity.
 This is a controlled manual correction through the allow-listed privileged

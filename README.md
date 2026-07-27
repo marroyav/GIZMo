@@ -5,13 +5,13 @@ owned package, `gizmo-runtime`, with one operational entry point:
 `gizmo.target`.
 
 The package deliberately uses separate systemd services for the overlay,
-network, impedance monitor, display, ZeroMQ, temperature, SDR, and OPC UA
-components. Systemd owns startup ordering, privileges, restarts, logs, and
-shutdown. Operators still start and stop the product as one unit.
+network, impedance monitor, display, ZeroMQ, temperature, SDR, OPC UA, and
+live-dashboard components. Systemd owns startup ordering, privileges, restarts,
+logs, and shutdown. Operators still start and stop the product as one unit.
 
-> Status: runtime 0.2.9 is the maintained package. It was installed and
-> cold-boot tested on the borrowed instrument on 27 July 2026. Installation
-> itself does not enable or start `gizmo.target`.
+> Status: runtime 0.3.0 is the maintained package. Its predecessor, 0.2.9, was
+> installed and cold-boot tested on the borrowed instrument on 27 July 2026.
+> Installation itself does not enable or start `gizmo.target`.
 
 ## Runtime map
 
@@ -26,6 +26,7 @@ shutdown. Operators still start and stop the product as one unit.
 | temperature stream | `gizmo-temperature.service` | TCP 5005 | `gizmo` |
 | SDR stream | `gizmo-sdr.service` | TCP 5556 | root, `CAP_SYS_RAWIO` |
 | canonical OPC UA server | `gizmo-opcua.service` | TCP 4840 | `gizmo` |
+| live web dashboard | `gizmo-dashboard.service` | HTTP 8080 | `gizmo` |
 
 Only the two Processing System Ethernet ports are configured. Defaults match
 the recovered board:
@@ -80,6 +81,11 @@ See [the OPC UA contract](docs/opcua.md). The recovered
 `SimpleOPCUAServer/CommandObject` namespace and text ZeroMQ API remain as
 compatibility interfaces during migration.
 
+The board also serves a read-only live console at
+`http://<gizmo-address>:8080/`. It uses one shared OPC UA subscription,
+preserves value status codes, plots up to one hour in the browser, and exports
+the visible history to CSV. See [the dashboard guide](docs/dashboard.md).
+
 On a non-Python-3.10 development host, a structure-only package can be checked
 with `BUNDLE_PYTHON_DEPS=0 make deb`. That artifact is not suitable for the
 Kria.
@@ -90,7 +96,7 @@ Read [the migration procedure](docs/migration.md) before touching a running
 legacy image. The safe high-level sequence is:
 
 ```sh
-sudo dpkg -i build/gizmo-runtime_0.2.9_arm64.deb
+sudo dpkg -i build/gizmo-runtime_0.3.0_arm64.deb
 sudo gizmo-doctor
 ```
 

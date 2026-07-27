@@ -5,6 +5,9 @@ designed for an isolated controls network, not an untrusted LAN.
 
 - By default, ZeroMQ, temperature, ZMon, SDR, and OPC UA endpoints have no
   transport authentication or encryption.
+- The dashboard on TCP 8080 is read-only and has no third-party browser assets,
+  but its HTTP transport has no authentication or encryption and exposes
+  instrument, network, firmware, and OS inventory.
 - The canonical OPC UA namespace includes validated configuration writes and
   explicit methods. With `SecurityPolicy None`, any client that can reach TCP
   4840 can invoke them.
@@ -15,9 +18,10 @@ designed for an isolated controls network, not an untrusted LAN.
   sysfs access.
 - The supplied user manual contains a default operating-system credential.
 
-Place PS interfaces on a restricted controls VLAN, filter ports 4840, 5005,
-5055, 5555, and 5556 at the network boundary, and rotate the image's default
-credential before production use.
+Place PS interfaces on a restricted controls VLAN, filter ports 8080, 4840,
+5005, 5055, 5555, and 5556 at the network boundary, and rotate the image's
+default credential before production use. If the dashboard must cross that
+boundary, use a site-managed authenticated TLS reverse proxy.
 
 The OPC UA server code can configure `Basic256Sha256` signed/encrypted
 channels, but the recovered offline dependency set does not bundle Python

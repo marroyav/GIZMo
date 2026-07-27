@@ -17,7 +17,8 @@ gizmo.target
 │   └── gizmo-sdr.service ────── TCP 5556
 ├── gizmo-control.socket ─────── /run/gizmo/control.sock
 ├── gizmo-zmq.service ────────── TCP 5555
-└── gizmo-opcua.service ──────── OPC UA TCP 4840
+├── gizmo-opcua.service ──────── OPC UA TCP 4840
+└── gizmo-dashboard.service ──── read-only HTTP TCP 8080
 ```
 
 The OPC UA server consumes ZeroMQ, temperature, and SDR and directly observes
@@ -28,6 +29,12 @@ package target. `PartOf=gizmo.target` still gives the operator one complete
 start/stop boundary. The public server remains browsable and reports non-good
 OPC UA status codes when a producer fails. The display and compatibility
 ZeroMQ service consume ZMon's TCP feed.
+
+The dashboard resolves and subscribes to the canonical OPC UA namespace once,
+caches scalar monitoring values, and fans that cache out to browsers with
+server-sent events. Browser count therefore does not multiply OPC UA sessions
+or producer reads. Its one-hour trend buffer lives only in each browser; the
+runtime does not claim to be a persistent historian.
 
 The typed `urn:fnal:gizmo` OPC UA namespace is the sole supported public
 machine contract. The recovered text and `SimpleOPCUAServer` interfaces are
@@ -40,7 +47,8 @@ GPIO sysfs nodes. Those processes retain narrowly bounded root execution until
 their device access can be converted to UIO, VFIO, GPIO character devices, or
 dedicated udev permissions.
 
-ZeroMQ, temperature, and OPC UA run as the locked `gizmo` system user.
+ZeroMQ, temperature, OPC UA, and the dashboard run as the locked `gizmo`
+system user.
 The temperature I2C node is group-owned by `gizmo`.
 
 The legacy ZeroMQ server invoked arbitrary `sudo` commands and reran
@@ -61,6 +69,7 @@ where the wall clock changed but the hardware RTC did not.
 |---|---|---|
 | `/usr/bin`, `/usr/libexec/gizmo` | executables and service code | package only |
 | `/usr/lib/gizmo/python` | pinned Python runtime dependencies | package only |
+| `/usr/share/gizmo/dashboard` | self-contained browser assets | package only |
 | `/lib/firmware/xilinx/GIZMo_Kria_3_7_25` | compiled overlay | package only |
 | `/etc/gizmo` | administrator configuration | dpkg conffiles |
 | `/usr/share/gizmo/default-state` | factory/recovered defaults | package only |
@@ -73,14 +82,16 @@ therefore do not overwrite device calibration or operator values.
 ## Ordering and failure behavior
 
 1. Starting `gizmo.target` orders and starts network setup, overlay loading,
-   ZMon, the control socket, and the canonical OPC UA service.
+   ZMon, the control socket, the canonical OPC UA service, and its dashboard.
 2. Hardware consumers require successful overlay setup.
 3. ZeroMQ requires ZMon and the privileged control socket.
 4. OPC UA starts after its producers but remains available when an optional
    producer fails.
 5. Long-running services use bounded restart delays; OPC UA additionally uses
    systemd readiness and watchdog notifications.
-6. Stopping `gizmo.target` stops every component; hardware teardown unloads the
+6. The dashboard starts after OPC UA, remains read-only, and reconnects without
+   creating new producer sessions.
+7. Stopping `gizmo.target` stops every component; hardware teardown unloads the
    overlay last through dependency ordering.
 
 An intentional ZMon restart does not stop `gizmo.target`, ZeroMQ, OPC UA, the

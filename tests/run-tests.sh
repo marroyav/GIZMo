@@ -37,6 +37,10 @@ PYTHONPYCACHEPREFIX="$temporary/pycache" "$test_python" \
     "$repo_root/tests/test_opcua_model.py"
 echo "ok   OPC UA semantic model tests"
 
+PYTHONPYCACHEPREFIX="$temporary/pycache" "$test_python" \
+    "$repo_root/tests/test_dashboard.py"
+echo "ok   live dashboard contract tests"
+
 if "$test_python" -c 'import numpy, opcua, zmq' >/dev/null 2>&1; then
     PYTHONPYCACHEPREFIX="$temporary/pycache" "$test_python" \
         "$repo_root/tests/test_opcua_address_space.py"
@@ -131,6 +135,16 @@ if ! grep -q '^TimeoutStartSec=90$' \
     exit 1
 fi
 echo "ok   OPC UA cold-boot startup allowance"
+
+if ! grep -q 'gizmo-dashboard\.service' \
+        "$repo_root/packaging/systemd/gizmo.target" ||
+    ! grep -q '^ExecStart=.*/gizmo_dashboard\.py$' \
+        "$repo_root/packaging/systemd/gizmo-dashboard.service" ||
+    ! grep -q 'web/dashboard/\\*' "$repo_root/Makefile"; then
+    echo "Live dashboard is not fully owned by the runtime package" >&2
+    exit 1
+fi
+echo "ok   dashboard lifecycle and asset ownership"
 
 if grep -q '^Requires=' "$repo_root/packaging/systemd/gizmo.target" ||
     grep -q '^Requires=.*gizmo-zmon' \

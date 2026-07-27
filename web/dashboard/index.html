@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f3f5f1">
+  <meta name="description" content="Live read-only monitoring for the GIZMo Kria ground impedance monitor.">
+  <title>GIZMo · Live instrument</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to telemetry</a>
+
+  <header class="topbar">
+    <div class="brand" aria-label="GIZMo live dashboard">
+      <span class="brand-mark" aria-hidden="true">
+        <span></span><span></span><span></span>
+      </span>
+      <span class="brand-word">GIZMo</span>
+      <span class="brand-mode">Live</span>
+    </div>
+
+    <div class="connection-cluster">
+      <div class="connection-copy">
+        <span id="connection-label">Connecting to instrument</span>
+        <span id="connection-detail">Waiting for OPC UA</span>
+      </div>
+      <span id="connection-dot" class="status-orb status-unknown" aria-hidden="true"></span>
+      <time id="header-clock" class="header-clock">--:--:--</time>
+    </div>
+  </header>
+
+  <main id="main" class="page-shell">
+    <section class="instrument-heading" aria-labelledby="instrument-title">
+      <div>
+        <p class="eyebrow">Ground impedance monitor</p>
+        <h1 id="instrument-title">Kria instrument console</h1>
+      </div>
+      <div class="identity-strip">
+        <span id="identity-host">host —</span>
+        <span id="identity-runtime">runtime —</span>
+        <span id="identity-timezone">timezone —</span>
+      </div>
+    </section>
+
+    <section class="hero-grid" aria-label="Primary instrument readings">
+      <article id="resistance-card" class="card resistance-card quality-unknown">
+        <div class="card-topline">
+          <div>
+            <p class="eyebrow">Equivalent resistance</p>
+            <p id="measurement-status" class="microcopy">Waiting for first sample</p>
+          </div>
+          <span id="measurement-quality" class="quality-chip quality-unknown">Unknown</span>
+        </div>
+
+        <div class="resistance-reading" aria-live="polite">
+          <span id="resistance-value">—</span>
+          <span id="resistance-unit">Ω</span>
+        </div>
+
+        <div class="threshold-track" aria-hidden="true">
+          <div id="threshold-fill" class="threshold-fill"></div>
+          <div id="threshold-marker" class="threshold-marker"></div>
+        </div>
+
+        <dl class="hero-details">
+          <div>
+            <dt>Threshold</dt>
+            <dd id="threshold-value">—</dd>
+          </div>
+          <div>
+            <dt>Capacitance</dt>
+            <dd id="capacitance-value">—</dd>
+          </div>
+          <div>
+            <dt>Phase</dt>
+            <dd id="phase-value">—</dd>
+          </div>
+          <div>
+            <dt>Stimulus</dt>
+            <dd id="frequency-value">—</dd>
+          </div>
+        </dl>
+      </article>
+
+      <aside class="hero-side">
+        <article id="alarm-card" class="card alarm-card state-unknown">
+          <div class="alarm-icon" aria-hidden="true"><span></span></div>
+          <div>
+            <p class="eyebrow">Ground condition</p>
+            <h2 id="alarm-title">Establishing state</h2>
+            <p id="alarm-reason">No alarm state received yet.</p>
+          </div>
+          <dl class="alarm-times">
+            <div>
+              <dt>Local</dt>
+              <dd id="local-time">—</dd>
+            </div>
+            <div>
+              <dt>Latched</dt>
+              <dd id="latch-time">Never</dd>
+            </div>
+          </dl>
+        </article>
+
+        <article class="card pulse-card">
+          <div class="section-title-row">
+            <div>
+              <p class="eyebrow">System pulse</p>
+              <h2>At a glance</h2>
+            </div>
+            <span id="overall-health" class="quality-chip quality-unknown">Unknown</span>
+          </div>
+          <div id="pulse-grid" class="pulse-grid" aria-live="polite">
+            <div class="pulse-item"><span>Chassis</span><strong>—</strong></div>
+            <div class="pulse-item"><span>CPU</span><strong>—</strong></div>
+            <div class="pulse-item"><span>Memory</span><strong>—</strong></div>
+            <div class="pulse-item"><span>Root disk</span><strong>—</strong></div>
+            <div class="pulse-item"><span>Clock</span><strong>—</strong></div>
+            <div class="pulse-item"><span>FPGA</span><strong>—</strong></div>
+          </div>
+        </article>
+      </aside>
+    </section>
+
+    <section class="card trend-card" aria-labelledby="trend-title">
+      <div class="trend-heading">
+        <div>
+          <p class="eyebrow">Live history</p>
+          <h2 id="trend-title">Impedance</h2>
+          <p id="trend-subtitle" class="section-copy">Equivalent resistance and configured threshold</p>
+        </div>
+        <div class="trend-actions">
+          <label class="select-control">
+            <span>Window</span>
+            <select id="range-select" aria-label="Plot time window">
+              <option value="60">1 min</option>
+              <option value="300">5 min</option>
+              <option value="900" selected>15 min</option>
+              <option value="3600">1 hr</option>
+            </select>
+          </label>
+          <button id="pause-button" class="button button-secondary" type="button">Pause plot</button>
+          <button id="export-button" class="button button-primary" type="button">Export CSV</button>
+        </div>
+      </div>
+
+      <nav id="chart-tabs" class="chart-tabs" aria-label="Trend selection"></nav>
+
+      <div id="chart-shell" class="chart-shell">
+        <canvas id="trend-canvas" role="img" aria-label="Live GIZMo trend plot"></canvas>
+        <div id="chart-empty" class="chart-empty">
+          <span class="empty-wave" aria-hidden="true"></span>
+          <strong>Building live history</strong>
+          <span>The first points will appear as OPC UA samples arrive.</span>
+        </div>
+        <div id="chart-tooltip" class="chart-tooltip" hidden></div>
+      </div>
+      <div id="chart-legend" class="chart-legend" aria-label="Plot legend"></div>
+      <p id="plot-state" class="plot-state">Live · retaining up to one hour in this browser</p>
+    </section>
+
+    <section class="status-grid">
+      <article class="card status-card" aria-labelledby="health-title">
+        <div class="section-title-row">
+          <div>
+            <p class="eyebrow">Subsystem quality</p>
+            <h2 id="health-title">Instrument health</h2>
+          </div>
+          <span id="health-summary">—</span>
+        </div>
+        <div id="health-grid" class="health-grid"></div>
+      </article>
+
+      <article class="card status-card" aria-labelledby="network-title">
+        <div class="section-title-row">
+          <div>
+            <p class="eyebrow">Physical interfaces</p>
+            <h2 id="network-title">Network</h2>
+          </div>
+          <span id="network-summary">—</span>
+        </div>
+        <div id="network-grid" class="network-grid"></div>
+      </article>
+    </section>
+
+    <section class="card services-card" aria-labelledby="services-title">
+      <div class="section-title-row">
+        <div>
+          <p class="eyebrow">Runtime ownership</p>
+          <h2 id="services-title">Managed services</h2>
+          <p class="section-copy">Process state and automatic restart counts reported by systemd.</p>
+        </div>
+        <span id="services-summary" class="summary-number">—</span>
+      </div>
+      <div id="services-grid" class="services-grid"></div>
+    </section>
+
+    <section class="card variables-card" aria-labelledby="variables-title">
+      <div class="variables-heading">
+        <div>
+          <p class="eyebrow">Canonical OPC UA model</p>
+          <h2 id="variables-title">Variable explorer</h2>
+          <p class="section-copy">Every monitored value below is read-only and carries its OPC UA status code.</p>
+        </div>
+        <div class="variable-controls">
+          <label class="search-control">
+            <span class="visually-hidden">Search variables</span>
+            <input id="variable-search" type="search" placeholder="Search variables" autocomplete="off">
+          </label>
+          <label class="select-control group-select">
+            <span class="visually-hidden">Filter variable group</span>
+            <select id="group-select" aria-label="Filter variable group">
+              <option value="">All groups</option>
+            </select>
+          </label>
+        </div>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th scope="col">Variable</th>
+              <th scope="col">Value</th>
+              <th scope="col">Status</th>
+              <th scope="col">Updated</th>
+            </tr>
+          </thead>
+          <tbody id="variable-table"></tbody>
+        </table>
+      </div>
+      <div class="table-footer">
+        <span id="variable-count">0 variables</span>
+        <span>Namespace <code>urn:fnal:gizmo</code></span>
+      </div>
+    </section>
+
+    <section class="card events-card" aria-labelledby="events-title">
+      <div class="section-title-row">
+        <div>
+          <p class="eyebrow">State changes</p>
+          <h2 id="events-title">Session log</h2>
+        </div>
+        <button id="clear-events" class="text-button" type="button">Clear</button>
+      </div>
+      <ol id="event-list" class="event-list">
+        <li><time>Now</time><span>Dashboard session started.</span></li>
+      </ol>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <span>GIZMo Kria · read-only instrument view</span>
+    <span id="footer-endpoint">OPC UA endpoint —</span>
+  </footer>
+
+  <noscript>
+    <div class="noscript">This live dashboard requires JavaScript to render OPC UA telemetry.</div>
+  </noscript>
+  <script src="/app.js" defer></script>
+</body>
+</html>
