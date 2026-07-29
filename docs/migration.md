@@ -19,7 +19,7 @@ Copy the backup off the instrument.
 ## 2. Install without activating
 
 ```sh
-sudo dpkg -i gizmo-runtime_0.3.1_arm64.deb
+sudo dpkg -i gizmo-runtime_0.4.3_arm64.deb
 sudo gizmo-doctor
 ```
 
@@ -97,7 +97,13 @@ At minimum:
 10. a reboot returns the same state, MAC addresses, and IP addresses, and
     `Network/Interfaces/*/MacAddressSource` reports their observed provenance.
 11. `http://<gizmo-address>:8080/` shows live OPC UA values and
-    `/healthz` reports `opcua_connected: true`.
+    `/healthz` reports `opcua_connected: true`;
+12. `sudo gizmo-historian-client status` reports `opcua_connected: true`, its
+    fast sample count advances, and dashboard History mode can query those
+    rows.
+13. deliberately asserting either a resistance or phase alarm makes
+    `GIZMo.Alarm.Active` true, colors the dashboard orange, and produces a
+    timestamped alarm sample/event in History mode.
 
 Use `journalctl -u 'gizmo-*' -b` for diagnostics.
 

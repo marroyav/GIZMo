@@ -7,7 +7,11 @@ designed for an isolated controls network, not an untrusted LAN.
   transport authentication or encryption.
 - The dashboard on TCP 8080 is read-only and has no third-party browser assets,
   but its HTTP transport has no authentication or encryption and exposes
-  instrument, network, firmware, and OS inventory.
+  current and historical instrument, network, firmware, and OS inventory.
+- The SQLite historian is not a network listener. Its mode-`0660` query socket
+  is private to the `gizmo` account, and the dashboard forwards only bounded
+  read-only routes. The retained database still contains operational history
+  and must be protected in backups and disk images.
 - The canonical OPC UA namespace includes validated configuration writes and
   explicit methods. With `SecurityPolicy None`, any client that can reach TCP
   4840 can invoke them.

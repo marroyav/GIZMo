@@ -5,13 +5,17 @@ owned package, `gizmo-runtime`, with one operational entry point:
 `gizmo.target`.
 
 The package deliberately uses separate systemd services for the overlay,
-network, impedance monitor, display, ZeroMQ, temperature, SDR, OPC UA, and
-live-dashboard components. Systemd owns startup ordering, privileges, restarts,
-logs, and shutdown. Operators still start and stop the product as one unit.
+network, impedance monitor, display, ZeroMQ, temperature, SDR, OPC UA,
+persistent historian, and web-dashboard components. Systemd owns startup
+ordering, privileges, restarts, logs, and shutdown. Operators still start and
+stop the product as one unit.
 
-> Status: runtime 0.3.1 is the maintained package. Runtime 0.3.0 was installed
-> and live-tested, and runtime 0.2.9 was installed and cold-boot tested, on the
-> borrowed instrument on 27 July 2026.
+> Status: runtime 0.4.3 is the maintained package. It adds the ZMon
+> measurement engine's authoritative composite relay/beacon alarm to OPC UA,
+> the historian, and the full-width dark operations dashboard without
+> reimplementing the resistance/phase decision in monitoring code. Runtime
+> 0.4.0 was installed and historian-restart tested, and
+> runtime 0.2.9 was cold-boot tested, on the borrowed instrument.
 > Installation itself does not enable or start `gizmo.target`.
 
 ## Runtime map
@@ -27,7 +31,8 @@ logs, and shutdown. Operators still start and stop the product as one unit.
 | temperature stream | `gizmo-temperature.service` | TCP 5005 | `gizmo` |
 | SDR stream | `gizmo-sdr.service` | TCP 5556 | root, `CAP_SYS_RAWIO` |
 | canonical OPC UA server | `gizmo-opcua.service` | TCP 4840 | `gizmo` |
-| live web dashboard | `gizmo-dashboard.service` | HTTP 8080 | `gizmo` |
+| persistent historian | `gizmo-historian.service` | private Unix socket | `gizmo` |
+| live and historical dashboard | `gizmo-dashboard.service` | HTTP 8080 | `gizmo` |
 
 Only the two Processing System Ethernet ports are configured. Defaults match
 the recovered board:
@@ -82,10 +87,20 @@ See [the OPC UA contract](docs/opcua.md). The recovered
 `SimpleOPCUAServer/CommandObject` namespace and text ZeroMQ API remain as
 compatibility interfaces during migration.
 
-The board also serves a read-only live console at
-`http://<gizmo-address>:8080/`. It uses one shared OPC UA subscription,
-preserves value status codes, plots up to one hour in the browser, and exports
-the visible history to CSV. See [the dashboard guide](docs/dashboard.md).
+The board also serves a read-only console at
+`http://<gizmo-address>:8080/`. It uses one shared live OPC UA subscription,
+preserves value status codes, plots up to one hour in the browser, and queries
+package-owned persistent history for longer intervals and CSV export. See
+[the dashboard guide](docs/dashboard.md) and
+[historian design](docs/historian.md).
+
+Local historian inspection is intentionally restricted to privileged
+operators:
+
+```sh
+sudo gizmo-historian-client status
+sudo gizmo-historian-client series
+```
 
 On a non-Python-3.10 development host, a structure-only package can be checked
 with `BUNDLE_PYTHON_DEPS=0 make deb`. That artifact is not suitable for the
@@ -97,7 +112,7 @@ Read [the migration procedure](docs/migration.md) before touching a running
 legacy image. The safe high-level sequence is:
 
 ```sh
-sudo dpkg -i build/gizmo-runtime_0.3.1_arm64.deb
+sudo dpkg -i build/gizmo-runtime_0.4.3_arm64.deb
 sudo gizmo-doctor
 ```
 

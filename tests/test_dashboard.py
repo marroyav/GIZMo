@@ -71,6 +71,58 @@ class DashboardContractTests(unittest.TestCase):
         self.assertFalse(hasattr(dashboard.DashboardHandler, "do_PUT"))
         self.assertFalse(hasattr(dashboard.DashboardHandler, "do_DELETE"))
 
+    def test_browser_uses_semantic_industrial_status_design(self) -> None:
+        html = (REPO_ROOT / "web" / "dashboard" / "index.html").read_text()
+        javascript = (REPO_ROOT / "web" / "dashboard" / "app.js").read_text()
+        stylesheet = (
+            REPO_ROOT / "web" / "dashboard" / "styles.css"
+        ).read_text()
+
+        self.assertIn('<nav class="section-nav"', html)
+        self.assertIn('<details id="variables"', html)
+        self.assertIn("<output id=\"resistance-value\"", html)
+        self.assertIn('id="chart-stack"', html)
+        self.assertNotIn('id="chart-tabs"', html)
+        self.assertIn("--graphite:", stylesheet)
+        self.assertIn("--amber-strong:", stylesheet)
+        self.assertIn("--canvas: #1c1f22", stylesheet)
+        self.assertIn("--surface: #25292d", stylesheet)
+        self.assertIn("--emerald: #b8c41f", stylesheet)
+        self.assertIn("--alarm: #ff6a2a", stylesheet)
+        self.assertEqual(stylesheet.count("#ff6a2a"), 1)
+        self.assertIn('const HIGH_Z_COLOR = "#b8c41f"', javascript)
+        self.assertIn('"JetBrains Mono"', stylesheet)
+        self.assertIn("grid-template-columns: repeat(2", stylesheet)
+        self.assertRegex(
+            stylesheet,
+            r"\.chart-panel\s*\{[^}]*\bborder:\s*0;",
+        )
+        self.assertRegex(stylesheet, r"\.card\s*\{[^}]*\bborder:\s*0;")
+        self.assertRegex(
+            stylesheet,
+            r"\.alarm-card\.state-clear[\s\S]*?h2\s*\{[^}]*#b8c41f",
+        )
+        self.assertIn("body.has-alarm", stylesheet)
+        self.assertIn(
+            'document.body.classList.toggle("has-alarm", activeAlarm)',
+            javascript,
+        )
+        self.assertIn('const ALARM_COLOR = "#ff6a2a"', javascript)
+        self.assertIn('alarm: "Authoritative composite relay/beacon alarm', javascript)
+        self.assertIn("function drawCharts()", javascript)
+
+        alarm_view = next(
+            view for view in dashboard.CHART_VIEWS if view["id"] == "alarm"
+        )
+        self.assertEqual(alarm_view["paths"], ["Alarm.Active"])
+        self.assertTrue(dashboard.CATALOG["Alarm.Active"].chartable)
+        render_alarm = javascript.split("function renderAlarm()", 1)[1].split(
+            "function pulseItem", 1
+        )[0]
+        self.assertIn('boolean("Alarm.Active")', render_alarm)
+        self.assertNotIn("Measurement.Resistance", render_alarm)
+        self.assertNotIn("Measurement.Phase", render_alarm)
+
     def test_uncertain_notification_retains_last_usable_value(self) -> None:
         path = "Measurement.ThresholdOhm"
         monitor = dashboard.OpcUaMonitor("opc.tcp://unused", 500)
@@ -150,7 +202,22 @@ class DashboardHttpTests(unittest.TestCase):
         self.assertEqual(catalog["namespace_uri"], "urn:fnal:gizmo")
         self.assertGreater(len(catalog["variables"]), 100)
         self.assertEqual(catalog["resistance_high_z_floor_ohm"], 500)
+        self.assertFalse(catalog["history_available"])
         self.assertTrue(health["opcua_connected"])
+        self.assertFalse(health["historian_available"])
+
+    def test_unavailable_historian_is_a_bounded_degraded_route(self) -> None:
+        with self.assertRaises(urllib.error.HTTPError) as raised:
+            urllib.request.urlopen(
+                self.base + "/api/history/status",
+                timeout=2,
+            )
+
+        self.assertEqual(raised.exception.code, 503)
+        self.assertEqual(
+            json.loads(raised.exception.read()),
+            {"error": "persistent history is unavailable"},
+        )
 
     def test_mutating_http_request_is_rejected(self) -> None:
         request = urllib.request.Request(

@@ -49,6 +49,7 @@ install: all
 	install -D -m 0755 scripts/gizmo-network-setup $(DESTDIR)$(PREFIX)/libexec/gizmo/gizmo-network-setup
 	install -D -m 0755 scripts/gizmo-doctor $(DESTDIR)$(PREFIX)/bin/gizmo-doctor
 	install -D -m 0755 scripts/gizmo-opcua-client $(DESTDIR)$(PREFIX)/bin/gizmo-opcua-client
+	install -D -m 0755 scripts/gizmo-historian-client $(DESTDIR)$(PREFIX)/bin/gizmo-historian-client
 	install -d -m 0755 $(DESTDIR)$(PREFIX)/libexec/gizmo
 	install -m 0644 src/python/*.py $(DESTDIR)$(PREFIX)/libexec/gizmo/
 	install -D -m 0644 VERSION $(DESTDIR)$(PREFIX)/share/gizmo/VERSION

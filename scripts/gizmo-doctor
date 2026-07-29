@@ -32,9 +32,11 @@ check "OPC-UA Python module" env \
     PYTHONPATH=/usr/lib/gizmo/python:/usr/libexec/gizmo \
     PYTHONNOUSERSITE=1 python3 -c 'import opcua'
 check "OPC UA operator client" test -x /usr/bin/gizmo-opcua-client
+check "historian operator client" test -x /usr/bin/gizmo-historian-client
 check "dashboard assets" test -r /usr/share/gizmo/dashboard/index.html
 check "gizmo.target installed" systemctl cat gizmo.target
 check "gizmo-opcua.service installed" systemctl cat gizmo-opcua.service
+check "gizmo-historian.service installed" systemctl cat gizmo-historian.service
 check "gizmo-dashboard.service installed" systemctl cat gizmo-dashboard.service
 
 if systemctl is-active --quiet gizmo.target; then
@@ -50,6 +52,8 @@ if systemctl is-active --quiet gizmo.target; then
         PYTHONNOUSERSITE=1 python3 -c \
         'import json,sys,urllib.request; data=json.load(urllib.request.urlopen("http://127.0.0.1:"+sys.argv[1]+"/healthz", timeout=3)); raise SystemExit(0 if data.get("opcua_connected") else 1)' \
         "$dashboard_port"
+    check "persistent historian and database" env \
+        PYTHONNOUSERSITE=1 gizmo-historian-client --timeout 3 status
     printf '\nActive services:\n'
     systemctl --no-pager --plain list-dependencies gizmo.target
 else

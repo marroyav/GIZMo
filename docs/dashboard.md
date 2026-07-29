@@ -1,4 +1,4 @@
-# Live web dashboard
+# Live and historical web dashboard
 
 ## Purpose
 
@@ -20,10 +20,36 @@ The top of the page intentionally emphasizes only the operator-critical state:
 - current alarm condition, board-local time, and latched time;
 - overall health and essential OS/firmware indicators.
 
-Lower sections provide selectable live trends, subsystem quality, both PS
-network interfaces, owned systemd services, and a searchable set of typed OPC
-UA monitoring variables. Selecting a chartable variable in the explorer opens
-it as a dedicated trend.
+Lower sections provide simultaneous live or persistent trends, subsystem
+quality, both PS network interfaces, owned systemd services, and a searchable
+set of typed OPC UA monitoring variables. The six standard plots share the
+same time range and synchronized cursor so impedance, thermal, lock-in, phase,
+alarm, and system behavior can be correlated without switching tabs.
+Selecting a chartable variable in the explorer adds it as another trend. The
+advanced variable inventory is collapsed by default so the operational page
+stays compact.
+
+## Visual status language
+
+The interface is a single dark industrial theme using JetBrains Mono when it
+is installed on the operator workstation, with packaged system monospace
+fallbacks. Status meaning is kept consistent across cards, chips, services,
+and variables:
+
+| Color | Meaning |
+|---|---|
+| chartreuse | healthy, connected, active, in-range, or intended `HIGH Z` |
+| orange | currently asserted ground alarm only |
+| steel gray | uncertain, unavailable, idle, or neutral status |
+| graphite and off-white | structure, charts, and text |
+
+A historical latch remains visible with its timestamp, but it does not turn
+the console orange after the active alarm condition has cleared.
+
+Color is never the only indicator: every state also has text, an OPC UA status
+code, an icon/dot, or a line label. The page uses semantic HTML5 landmarks,
+native date/time controls, a native disclosure for advanced telemetry, and
+keyboard-visible focus states.
 
 ## Data path
 
@@ -31,11 +57,12 @@ it as a dedicated trend.
 GIZMo producers
       │
       ▼
-gizmo-opcua.service ── one OPC UA subscription ── gizmo-dashboard.service
-                                                       │
-                                           cached JSON + server-sent events
-                                                       │
-                                           one or more local web browsers
+gizmo-opcua.service ── one live subscription ── gizmo-dashboard.service
+          │                                      │             ▲
+          │ one historian subscription           │ SSE         │ bounded GET
+          ▼                                      ▼             │
+gizmo-historian.service ─── SQLite ─── private Unix socket ─────┘
+                                             one or more browsers
 ```
 
 The server resolves `urn:fnal:gizmo` at connection time and subscribes to the
@@ -58,22 +85,31 @@ available; `Measurement.ResistanceRange = OutOfRange` is rendered as
 
 ## Plot behavior
 
-The browser retains at most one hour of samples in memory. This is a live
-session buffer, not a persistent historian:
+The explicit **Live / History** selector keeps the two data sources clear.
+Live mode retains at most one hour of samples in browser memory:
 
 - closing or reloading the tab clears its history;
 - the plot can show 1 minute, 5 minutes, 15 minutes, or 1 hour;
 - pausing freezes history collection in that tab while status tiles remain
   live;
-- **Export CSV** downloads the active view with UTC timestamps and an OPC UA
-  status-code column for every series.
+- **Export all CSV** downloads all plotted series with UTC timestamps and an
+  OPC UA status-code column for every series.
 
-The standard views cover impedance, temperatures, lock-in components, phase,
-and system utilization. Other chartable scalars can be selected from the
-variable explorer.
+History mode queries the package-owned SQLite historian and supports 1 hour,
+6 hour, 24 hour, 7 day, and custom local date/time windows. It indicates
+whether points are raw or rollups and exports the selected database interval.
+The server caps normal plots at 5,000 points and automatically selects or
+coarsens minute rollups for larger intervals.
 
-When `Measurement.ResistanceRange = OutOfRange`, the impedance plot adds an
-electric-blue `HIGH Z (>500 Ω)` trace at the 500 Ω validated-range boundary.
+The standard views cover the authoritative composite alarm, impedance,
+temperatures, lock-in components, phase, and system utilization
+simultaneously. The alarm trace is `0/NORMAL` in chartreuse and `1/ALARM` in
+orange. The live and historical paths both consume `Alarm.Active`; neither the
+browser nor dashboard server recomputes the resistance and phase rules.
+Other chartable scalars can be selected from the variable explorer.
+
+When `Measurement.ResistanceRange = OutOfRange`, the impedance plot adds a
+chartreuse `HIGH Z (>500 Ω)` trace at the 500 Ω validated-range boundary.
 This is a clipped visual state, not a fabricated 500 Ω measurement:
 `ResistanceOhm` remains unavailable with `BadOutOfRange`, and the impedance
 CSV exports the canonical range and its status code rather than replacing the
@@ -89,12 +125,18 @@ The same-origin browser API is deliberately small:
 | `/api/catalog` | monitored variable metadata and chart presets |
 | `/api/state` | latest cached values and connection state |
 | `/api/stream` | one-second server-sent-event stream |
+| `/api/history/status` | historian connection, storage, and time bounds |
+| `/api/history/series` | retained-series metadata |
+| `/api/history/query` | bounded raw or rollup query |
+| `/api/history/events` | bounded transition query |
+| `/api/history/export.csv` | bounded persistent CSV export |
 | `/healthz` | process and upstream OPC UA connection health |
 
-There are no HTTP write, command, login, upload, or proxy endpoints. POST
-requests return `405 Method Not Allowed`. Configuration and explicit
-instrument operations remain in the canonical OPC UA contract and its
-operator client.
+The history routes are a fixed read-only proxy to
+`/run/gizmo/historian.sock`; they cannot name a database file or submit SQL.
+There are no HTTP write, command, login, or upload endpoints. POST requests
+return `405 Method Not Allowed`. Configuration and explicit instrument
+operations remain in the canonical OPC UA contract and its operator client.
 
 ## Service configuration
 
@@ -106,6 +148,7 @@ GIZMO_DASHBOARD_BIND=0.0.0.0
 GIZMO_DASHBOARD_PORT=8080
 GIZMO_DASHBOARD_SUBSCRIPTION_MS=500
 GIZMO_DASHBOARD_PUBLISH_INTERVAL_SECONDS=1
+GIZMO_DASHBOARD_HISTORIAN_SOCKET=/run/gizmo/historian.sock
 ```
 
 After changing them:
@@ -117,8 +160,10 @@ curl http://127.0.0.1:8080/healthz
 ```
 
 The health response is `status: degraded` while the web service is alive but
-its OPC UA session is disconnected. The service reconnects with bounded
-backoff and browsers reconnect their event stream automatically.
+its OPC UA session is disconnected. `historian_available` separately reports
+whether the private query socket exists. History can be unavailable while
+live telemetry stays healthy. The service reconnects with bounded backoff and
+browsers reconnect their event stream automatically.
 
 ## Security boundary
 

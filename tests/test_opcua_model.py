@@ -29,7 +29,8 @@ class MeasurementModelTests(unittest.TestCase):
             (
                 "Data from C-server: Res=192.1,Cap=4,Th=100,Mag=91,"
                 "Phase=-0.230,Phase2=179.770,PhaseRX=179.700,"
-                "I=-20,Q=1,latched=1,LatchStamp=2026-07-27 10:11:12"
+                "I=-20,Q=1,Alarm=1,AlarmReason=PhaseInterpolation,"
+                "latched=1,LatchStamp=2026-07-27 10:11:12"
             ),
             sequence=7,
             averages_per_calculation=100,
@@ -44,6 +45,8 @@ class MeasurementModelTests(unittest.TestCase):
         self.assertEqual(result.threshold_ohm, 100.0)
         self.assertEqual(result.phase_atan_deg, -0.23)
         self.assertEqual(result.phase_atan2_deg, 179.77)
+        self.assertTrue(result.alarm_active)
+        self.assertEqual(result.alarm_reason, "PhaseInterpolation")
         self.assertTrue(result.alarm_latched)
         self.assertIsNotNone(result.latch_time)
         self.assertEqual(result.quality, QUALITY_GOOD)
@@ -52,7 +55,8 @@ class MeasurementModelTests(unittest.TestCase):
         result = parse_legacy_measurement(
             (
                 "Res=1050,Cap=0,Th=100,Mag=1,Phase=0,Phase2=0,"
-                "PhaseRX=0,I=1,Q=0,latched=0,LatchStamp="
+                "PhaseRX=0,I=1,Q=0,Alarm=0,AlarmReason=,"
+                "latched=0,LatchStamp="
             ),
             sequence=1,
             averages_per_calculation=100,
@@ -67,7 +71,8 @@ class MeasurementModelTests(unittest.TestCase):
         high = parse_legacy_measurement(
             (
                 "Res=500.1,Cap=0,Th=100,Mag=1,Phase=0,Phase2=0,"
-                "PhaseRX=0,I=1,Q=0,latched=0,LatchStamp="
+                "PhaseRX=0,I=1,Q=0,Alarm=0,AlarmReason=,"
+                "latched=0,LatchStamp="
             ),
             sequence=1,
             averages_per_calculation=100,
@@ -75,7 +80,8 @@ class MeasurementModelTests(unittest.TestCase):
         boundary = parse_legacy_measurement(
             (
                 "Res=500.0,Cap=0,Th=100,Mag=1,Phase=0,Phase2=0,"
-                "PhaseRX=0,I=1,Q=0,latched=0,LatchStamp="
+                "PhaseRX=0,I=1,Q=0,Alarm=0,AlarmReason=,"
+                "latched=0,LatchStamp="
             ),
             sequence=2,
             averages_per_calculation=100,
@@ -91,7 +97,8 @@ class MeasurementModelTests(unittest.TestCase):
         result = parse_legacy_measurement(
             (
                 "Res=200,Cap=-1,Th=100,Mag=1,Phase=0,Phase2=0,"
-                "PhaseRX=0,I=1,Q=0,latched=0,LatchStamp="
+                "PhaseRX=0,I=1,Q=0,Alarm=0,AlarmReason=,"
+                "latched=0,LatchStamp="
             ),
             sequence=2,
             averages_per_calculation=100,
@@ -111,6 +118,21 @@ class MeasurementModelTests(unittest.TestCase):
         self.assertEqual(result.quality, QUALITY_BAD)
         self.assertIsNone(result.capacitance_nf)
         self.assertIn("missing ZMon fields", result.diagnostic)
+
+    def test_alarm_is_consumed_from_zmon_not_recomputed(self) -> None:
+        result = parse_legacy_measurement(
+            (
+                "Res=200,Cap=4,Th=100,Mag=91,Phase=0,"
+                "Phase2=179.8,PhaseRX=150,I=-20,Q=1,"
+                "Alarm=0,AlarmReason=,latched=0,LatchStamp="
+            ),
+            sequence=8,
+            averages_per_calculation=100,
+        )
+
+        self.assertFalse(result.alarm_active)
+        self.assertEqual(result.alarm_reason, "")
+        self.assertEqual(result.quality, QUALITY_GOOD)
 
     def test_thermal_record_uses_explicit_sensor_names(self) -> None:
         result = parse_legacy_thermals("Chassis=24.5,CPU1=40.0,CPU2=41.0,CPU3=42.0")

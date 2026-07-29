@@ -532,7 +532,16 @@ void parse(const char *cmd)
                     ChangeRelay(15, 0);
                     printf("Un-equal Phase Alarm");
                 }*/
+                /*
+                 * This is the authoritative alarm decision.  Export this
+                 * exact value to monitoring clients instead of asking them
+                 * to reproduce the resistance/phase logic independently.
+                 */
+                int alarm_active = 0;
+                const char *alarm_reason = "";
                 if ((x_reverse > 8) && (fabs(phx_reverse - phase_deg2) > 1.5)){
+                    alarm_active = 1;
+                    alarm_reason = "PhaseInterpolation";
                     ChangeRelay(14, 0);
                     ChangeRelay(15, 0);
                     printf("Out of Phase Interpolation Alarm");
@@ -540,6 +549,8 @@ void parse(const char *cmd)
                 }
                 else if (x_reverse < global_th)
                 {
+                    alarm_active = 1;
+                    alarm_reason = "ResistanceThreshold";
                     if (latched == 0) {
                         char bufferTime[64];
                         readSystemTime(bufferTime, sizeof(bufferTime));
@@ -576,7 +587,7 @@ void parse(const char *cmd)
                     }
                     // No connection pending — just continue loop
                 } else {
-                    snprintf(buffer, sizeof(buffer), "Res=%.1f,Cap=%.0f,Th=%d,Mag=%.0f,Phase=%.3f,Phase2=%.3f,PhaseRX=%.3f,I=%.0f,Q=%.0f,latched=%d,LatchStamp=%s", x_reverse, calcCapacitance, global_th, mag, phase_deg, phase_deg2, phx_reverse, aveI, aveQ, latched, latchedStamp);
+                    snprintf(buffer, sizeof(buffer), "Res=%.1f,Cap=%.0f,Th=%d,Mag=%.0f,Phase=%.3f,Phase2=%.3f,PhaseRX=%.3f,I=%.0f,Q=%.0f,latched=%d,LatchStamp=%s,Alarm=%d,AlarmReason=%s", x_reverse, calcCapacitance, global_th, mag, phase_deg, phase_deg2, phx_reverse, aveI, aveQ, latched, latchedStamp, alarm_active, alarm_reason);
                     send(client_fd, buffer, strlen(buffer), 0);
                     //printf("Sent: %s\n", buffer);
                     close(client_fd);

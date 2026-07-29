@@ -41,6 +41,10 @@ PYTHONPYCACHEPREFIX="$temporary/pycache" "$test_python" \
     "$repo_root/tests/test_dashboard.py"
 echo "ok   live dashboard contract tests"
 
+PYTHONPYCACHEPREFIX="$temporary/pycache" "$test_python" \
+    "$repo_root/tests/test_historian.py"
+echo "ok   persistent historian tests"
+
 if "$test_python" -c 'import numpy, opcua, zmq' >/dev/null 2>&1; then
     PYTHONPYCACHEPREFIX="$temporary/pycache" "$test_python" \
         "$repo_root/tests/test_opcua_address_space.py"
@@ -145,6 +149,17 @@ if ! grep -q 'gizmo-dashboard\.service' \
     exit 1
 fi
 echo "ok   dashboard lifecycle and asset ownership"
+
+if ! grep -q 'gizmo-historian\.service' \
+        "$repo_root/packaging/systemd/gizmo.target" ||
+    ! grep -q '^ExecStart=.*/gizmo_historian\.py$' \
+        "$repo_root/packaging/systemd/gizmo-historian.service" ||
+    ! grep -q '/var/lib/gizmo/history' \
+        "$repo_root/packaging/tmpfiles/gizmo.conf"; then
+    echo "Persistent historian is not fully owned by the runtime package" >&2
+    exit 1
+fi
+echo "ok   historian lifecycle and storage ownership"
 
 if grep -q '^Requires=' "$repo_root/packaging/systemd/gizmo.target" ||
     grep -q '^Requires=.*gizmo-zmon' \

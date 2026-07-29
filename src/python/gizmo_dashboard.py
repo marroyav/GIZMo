@@ -5,10 +5,12 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as dt
+import http.client
 import json
 import math
 import mimetypes
 import os
+import socket
 import threading
 import time
 from http import HTTPStatus
@@ -29,6 +31,8 @@ DEFAULT_ENDPOINT = "opc.tcp://127.0.0.1:4840"
 DEFAULT_BIND = "0.0.0.0"
 DEFAULT_PORT = 8080
 DEFAULT_PUBLISH_INTERVAL = 1.0
+DEFAULT_HISTORIAN_SOCKET = "/run/gizmo/historian.sock"
+MAX_HISTORY_RESPONSE_BYTES = 32 * 1024 * 1024
 MAX_SSE_CLIENTS = 24
 HIGH_Z_FLOOR_OHM = float(
     os.environ.get("GIZMO_RESISTANCE_VALID_MAX_OHM", "500")
@@ -207,7 +211,18 @@ VARIABLES: list[VariableSpec] = [
         "String",
     ),
     variable("Alarm.Latched", "Alarm latched", "Alarm", "Boolean"),
-    variable("Alarm.Active", "Alarm active", "Alarm", "Boolean"),
+    variable(
+        "Alarm.Active",
+        "Composite alarm",
+        "Alarm",
+        "Boolean",
+        precision=0,
+        chartable=True,
+        description=(
+            "Authoritative ZMon relay/beacon alarm decision; displayed and "
+            "stored without recomputing resistance or phase rules."
+        ),
+    ),
     variable("Alarm.Reason", "Alarm reason", "Alarm", "String"),
     variable("Alarm.LatchTime", "Latch time", "Alarm", "DateTime"),
     variable(
@@ -514,6 +529,7 @@ SERVICE_UNITS = (
     "gizmo-sdr.service",
     "gizmo-zmq.service",
     "gizmo-opcua.service",
+    "gizmo-historian.service",
     "gizmo-dashboard.service",
 )
 
@@ -563,6 +579,12 @@ if len(CATALOG) != len(VARIABLES):
 
 
 CHART_VIEWS = [
+    {
+        "id": "alarm",
+        "label": "Alarm",
+        "unit": "state",
+        "paths": ["Alarm.Active"],
+    },
     {
         "id": "impedance",
         "label": "Impedance",
@@ -622,6 +644,13 @@ STATIC_ROUTES = {
     "/app.js": ("app.js", "text/javascript; charset=utf-8"),
     "/styles.css": ("styles.css", "text/css; charset=utf-8"),
 }
+HISTORY_ROUTES = {
+    "/api/history/status": "/status",
+    "/api/history/series": "/series",
+    "/api/history/query": "/query",
+    "/api/history/events": "/events",
+    "/api/history/export.csv": "/export.csv",
+}
 
 
 def json_value(value: Any) -> Any:
@@ -644,6 +673,18 @@ def utc_now() -> str:
 
 def status_name(status: Any) -> str:
     return getattr(status, "name", str(status))
+
+
+class UnixHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, socket_path: Path, timeout: float = 10.0) -> None:
+        super().__init__("localhost", timeout=timeout)
+        self.socket_path = socket_path
+
+    def connect(self) -> None:
+        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        connection.settimeout(self.timeout)
+        connection.connect(str(self.socket_path))
+        self.sock = connection
 
 
 class SubscriptionHandler:
@@ -901,11 +942,13 @@ class DashboardServer(ThreadingHTTPServer):
         monitor: OpcUaMonitor,
         asset_root: Path,
         publish_interval: float,
+        historian_socket: Path | None = None,
     ) -> None:
         super().__init__(server_address, handler)
         self.monitor = monitor
         self.asset_root = asset_root
         self.publish_interval = publish_interval
+        self.historian_socket = historian_socket
         self.sse_slots = threading.BoundedSemaphore(MAX_SSE_CLIENTS)
 
 
@@ -979,7 +1022,64 @@ class DashboardHandler(BaseHTTPRequestHandler):
             "views": CHART_VIEWS,
             "service_units": list(SERVICE_UNITS),
             "resistance_high_z_floor_ohm": HIGH_Z_FLOOR_OHM,
+            "history_available": bool(
+                self.dashboard.historian_socket
+                and self.dashboard.historian_socket.is_socket()
+            ),
         }
+
+    def _history(self, route: str, query: str) -> None:
+        socket_path = self.dashboard.historian_socket
+        if socket_path is None or not socket_path.is_socket():
+            self._json(
+                {"error": "persistent history is unavailable"},
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+            return
+        target = HISTORY_ROUTES[route]
+        if query:
+            target = f"{target}?{query}"
+        connection = UnixHTTPConnection(socket_path)
+        try:
+            connection.request("GET", target, headers={"Accept": "*/*"})
+            response = connection.getresponse()
+            length = response.getheader("Content-Length")
+            if length is not None and int(length) > MAX_HISTORY_RESPONSE_BYTES:
+                self._json(
+                    {"error": "history response exceeds dashboard limit"},
+                    HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                )
+                return
+            body = response.read(MAX_HISTORY_RESPONSE_BYTES + 1)
+            if len(body) > MAX_HISTORY_RESPONSE_BYTES:
+                self._json(
+                    {"error": "history response exceeds dashboard limit"},
+                    HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                )
+                return
+            self.send_response(response.status)
+            self._common_headers()
+            self.send_header(
+                "Content-Type",
+                response.getheader(
+                    "Content-Type",
+                    "application/octet-stream",
+                ),
+            )
+            self.send_header("Cache-Control", "no-store")
+            disposition = response.getheader("Content-Disposition")
+            if disposition:
+                self.send_header("Content-Disposition", disposition)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (OSError, TimeoutError, http.client.HTTPException) as error:
+            self._json(
+                {"error": f"persistent history is unavailable: {error}"},
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+        finally:
+            connection.close()
 
     def _stream(self) -> None:
         if not self.dashboard.sse_slots.acquire(blocking=False):
@@ -1012,7 +1112,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.dashboard.sse_slots.release()
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
-        route = urlsplit(self.path).path
+        split = urlsplit(self.path)
+        route = split.path
         if route in STATIC_ROUTES:
             self._static(route)
         elif route == "/api/catalog":
@@ -1021,6 +1122,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._json(self.dashboard.monitor.snapshot())
         elif route == "/api/stream":
             self._stream()
+        elif route in HISTORY_ROUTES:
+            self._history(route, split.query)
         elif route == "/healthz":
             snapshot = self.dashboard.monitor.snapshot()
             connected = snapshot["connection"]["connected"]
@@ -1028,6 +1131,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 {
                     "status": "ok" if connected else "degraded",
                     "opcua_connected": connected,
+                    "historian_available": bool(
+                        self.dashboard.historian_socket
+                        and self.dashboard.historian_socket.is_socket()
+                    ),
                     "generated_at": snapshot["generated_at"],
                 },
                 HTTPStatus.OK,
@@ -1084,6 +1191,12 @@ def main() -> None:
     asset_root = Path(
         os.environ.get("GIZMO_DASHBOARD_ASSET_ROOT", str(default_asset_root()))
     )
+    historian_socket = Path(
+        os.environ.get(
+            "GIZMO_DASHBOARD_HISTORIAN_SOCKET",
+            DEFAULT_HISTORIAN_SOCKET,
+        )
+    )
     if not asset_root.is_dir():
         raise SystemExit(f"dashboard asset directory is missing: {asset_root}")
     mimetypes.init()
@@ -1095,6 +1208,7 @@ def main() -> None:
         monitor,
         asset_root,
         publish_interval,
+        historian_socket,
     )
     print(
         f"GIZMo dashboard listening on http://{bind}:{port}; OPC UA {endpoint}",
