@@ -18,6 +18,7 @@ gizmo.target
 ├── gizmo-control.socket ─────── /run/gizmo/control.sock
 ├── gizmo-zmq.service ────────── TCP 5555
 ├── gizmo-opcua.service ──────── OPC UA TCP 4840
+├── gizmo-historian.service ──── SQLite + /run/gizmo/historian.sock
 └── gizmo-dashboard.service ──── read-only HTTP TCP 8080
 ```
 
@@ -33,8 +34,14 @@ ZeroMQ service consume ZMon's TCP feed.
 The dashboard resolves and subscribes to the canonical OPC UA namespace once,
 caches scalar monitoring values, and fans that cache out to browsers with
 server-sent events. Browser count therefore does not multiply OPC UA sessions
-or producer reads. Its one-hour trend buffer lives only in each browser; the
-runtime does not claim to be a persistent historian.
+or producer reads. Its one-hour live buffer remains browser-local.
+
+The historian has its own fixed OPC UA subscription and records compressed
+one-second and ten-second scalar snapshots, one-minute rollups, and state
+transitions in SQLite. The dashboard reaches it through a private read-only
+Unix socket only when History mode or historical CSV is requested. A historian
+failure therefore cannot break the live path. See the
+[historian design](historian.md).
 
 The typed `urn:fnal:gizmo` OPC UA namespace is the sole supported public
 machine contract. The recovered text and `SimpleOPCUAServer` interfaces are
@@ -47,8 +54,8 @@ GPIO sysfs nodes. Those processes retain narrowly bounded root execution until
 their device access can be converted to UIO, VFIO, GPIO character devices, or
 dedicated udev permissions.
 
-ZeroMQ, temperature, OPC UA, and the dashboard run as the locked `gizmo`
-system user.
+ZeroMQ, temperature, OPC UA, the historian, and the dashboard run as the locked
+`gizmo` system user.
 The temperature I2C node is group-owned by `gizmo`.
 
 The legacy ZeroMQ server invoked arbitrary `sudo` commands and reran
@@ -74,7 +81,8 @@ where the wall clock changed but the hardware RTC did not.
 | `/etc/gizmo` | administrator configuration | dpkg conffiles |
 | `/usr/share/gizmo/default-state` | factory/recovered defaults | package only |
 | `/var/lib/gizmo` | calibration, latch, ADC, runtime arguments | services/operator |
-| `/run/gizmo` | privileged control socket | transient |
+| `/var/lib/gizmo/history` | retained SQLite telemetry | historian only |
+| `/run/gizmo` | control and historian sockets | transient |
 
 `systemd-tmpfiles` copies defaults only when state is absent. Package upgrades
 therefore do not overwrite device calibration or operator values.
@@ -82,16 +90,18 @@ therefore do not overwrite device calibration or operator values.
 ## Ordering and failure behavior
 
 1. Starting `gizmo.target` orders and starts network setup, overlay loading,
-   ZMon, the control socket, the canonical OPC UA service, and its dashboard.
+   ZMon, the control socket, canonical OPC UA, historian, and dashboard.
 2. Hardware consumers require successful overlay setup.
 3. ZeroMQ requires ZMon and the privileged control socket.
 4. OPC UA starts after its producers but remains available when an optional
    producer fails.
 5. Long-running services use bounded restart delays; OPC UA additionally uses
    systemd readiness and watchdog notifications.
-6. The dashboard starts after OPC UA, remains read-only, and reconnects without
-   creating new producer sessions.
-7. Stopping `gizmo.target` stops every component; hardware teardown unloads the
+6. The historian starts after OPC UA, retains bounded data independently, and
+   exposes only its private read-only query socket.
+7. The dashboard starts after OPC UA and the historian, remains read-only, and
+   keeps its live view available if history fails.
+8. Stopping `gizmo.target` stops every component; hardware teardown unloads the
    overlay last through dependency ordering.
 
 An intentional ZMon restart does not stop `gizmo.target`, ZeroMQ, OPC UA, the

@@ -98,6 +98,13 @@ written back into `ResistanceOhm`.
 can contain implementation sentinels from the recovered engine, but it is not
 a physical-data or parsing contract.
 
+`Alarm.Active` is the authoritative composite Boolean emitted by ZMon at the
+same branch that controls the relay and beacon. It includes the engine's
+resistance and phase decisions; the OPC UA server, historian, and dashboard do
+not reproduce those rules. `Alarm.Reason` is the reason emitted alongside
+that decision. `Alarm.Latched` and `Alarm.LatchTime` remain the separate
+persistent latch state maintained by the engine.
+
 ## Operator client
 
 The package installs `gizmo-opcua-client`:
@@ -126,9 +133,11 @@ gizmo-opcua-client set-time 2026-07-27T09:15:00-06:00
 
 Generic OPC UA clients can browse or subscribe without this utility.
 
-The packaged [live web dashboard](dashboard.md) is another read-only client.
-It creates one subscription for the instrument and fans its cached state out
-to local browsers; browser count does not create additional OPC UA sessions.
+The packaged [web dashboard](dashboard.md) is another read-only client. It
+creates one subscription for live instrument data and fans its cached state
+out to local browsers. The separate
+[persistent historian](historian.md) creates one additional fixed
+subscription; historical browser queries do not open OPC UA sessions.
 
 `SetSystemTime` accepts an absolute OPC UA `DateTime`; the packaged client
 requires an ISO-8601 UTC offset (or trailing `Z`) to avoid timezone ambiguity.

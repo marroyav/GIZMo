@@ -1,0 +1,138 @@
+#!/usr/bin/env python3
+"""Read-only operator client for the local GIZMo historian."""
+
+from __future__ import annotations
+
+import argparse
+import http.client
+import json
+import socket
+import sys
+from pathlib import Path
+from urllib.parse import urlencode
+
+
+DEFAULT_SOCKET = "/run/gizmo/historian.sock"
+
+
+class UnixHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, socket_path: Path, timeout: float) -> None:
+        super().__init__("localhost", timeout=timeout)
+        self.socket_path = socket_path
+
+    def connect(self) -> None:
+        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        connection.settimeout(self.timeout)
+        connection.connect(str(self.socket_path))
+        self.sock = connection
+
+
+def request(
+    socket_path: Path,
+    target: str,
+    *,
+    timeout: float,
+) -> tuple[int, dict[str, str], bytes]:
+    connection = UnixHTTPConnection(socket_path, timeout)
+    try:
+        connection.request("GET", target, headers={"Accept": "*/*"})
+        response = connection.getresponse()
+        body = response.read()
+        headers = {key.lower(): value for key, value in response.getheaders()}
+        return response.status, headers, body
+    finally:
+        connection.close()
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(
+        description="Query the package-owned GIZMo persistent historian"
+    )
+    result.add_argument(
+        "--socket",
+        type=Path,
+        default=Path(DEFAULT_SOCKET),
+    )
+    result.add_argument("--timeout", type=float, default=15)
+    subparsers = result.add_subparsers(dest="command", required=True)
+    subparsers.add_parser("status")
+    subparsers.add_parser("series")
+
+    query = subparsers.add_parser("query")
+    query.add_argument("--from", dest="start", required=True)
+    query.add_argument("--to", dest="end", required=True)
+    query.add_argument("--max-points", type=int, default=5000)
+    query.add_argument("series", nargs="+")
+
+    events = subparsers.add_parser("events")
+    events.add_argument("--from", dest="start", required=True)
+    events.add_argument("--to", dest="end", required=True)
+    events.add_argument("--limit", type=int, default=1000)
+
+    export = subparsers.add_parser("export")
+    export.add_argument("--from", dest="start", required=True)
+    export.add_argument("--to", dest="end", required=True)
+    export.add_argument("--output", type=Path, required=True)
+    export.add_argument("series", nargs="+")
+    return result
+
+
+def main() -> None:
+    args = parser().parse_args()
+    if args.command == "status":
+        target = "/status"
+    elif args.command == "series":
+        target = "/series"
+    elif args.command == "query":
+        target = "/query?" + urlencode(
+            {
+                "from": args.start,
+                "to": args.end,
+                "max_points": args.max_points,
+                "series": ",".join(args.series),
+            }
+        )
+    elif args.command == "events":
+        target = "/events?" + urlencode(
+            {
+                "from": args.start,
+                "to": args.end,
+                "limit": args.limit,
+            }
+        )
+    else:
+        target = "/export.csv?" + urlencode(
+            {
+                "from": args.start,
+                "to": args.end,
+                "series": ",".join(args.series),
+            }
+        )
+
+    try:
+        status, headers, body = request(
+            args.socket,
+            target,
+            timeout=args.timeout,
+        )
+    except OSError as error:
+        raise SystemExit(f"historian unavailable: {error}") from error
+    if status >= 400:
+        try:
+            detail = json.loads(body).get("error")
+        except (ValueError, AttributeError):
+            detail = body.decode(errors="replace")
+        raise SystemExit(f"historian returned HTTP {status}: {detail}")
+    if args.command == "export":
+        args.output.write_bytes(body)
+        print(f"{args.output} ({len(body)} bytes)")
+        return
+    content_type = headers.get("content-type", "")
+    if "application/json" not in content_type:
+        sys.stdout.buffer.write(body)
+        return
+    print(json.dumps(json.loads(body), indent=2, sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()

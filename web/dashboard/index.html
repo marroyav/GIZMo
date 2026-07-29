@@ -3,9 +3,9 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#f3f5f1">
-  <meta name="description" content="Live read-only monitoring for the GIZMo Kria ground impedance monitor.">
-  <title>GIZMo · Live instrument</title>
+  <meta name="theme-color" content="#1c1f22">
+  <meta name="description" content="Read-only live and historical monitoring for the GIZMo Kria ground impedance monitor.">
+  <title>GIZMo · Instrument monitor</title>
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
@@ -17,10 +17,17 @@
         <span></span><span></span><span></span>
       </span>
       <span class="brand-word">GIZMo</span>
-      <span class="brand-mode">Live</span>
+      <span class="brand-mode">Read only</span>
     </div>
 
-    <div class="connection-cluster">
+    <nav class="section-nav" aria-label="Dashboard sections">
+      <a href="#overview">Overview</a>
+      <a href="#trends">Trends</a>
+      <a href="#systems">Systems</a>
+      <a href="#variables">Data</a>
+    </nav>
+
+    <div class="connection-cluster" aria-live="polite">
       <div class="connection-copy">
         <span id="connection-label">Connecting to instrument</span>
         <span id="connection-detail">Waiting for OPC UA</span>
@@ -31,19 +38,19 @@
   </header>
 
   <main id="main" class="page-shell">
-    <section class="instrument-heading" aria-labelledby="instrument-title">
+    <header class="instrument-heading">
       <div>
-        <p class="eyebrow">Ground impedance monitor</p>
+        <p class="eyebrow">Ground impedance monitor · operations</p>
         <h1 id="instrument-title">Kria instrument console</h1>
       </div>
-      <div class="identity-strip">
-        <span id="identity-host">host —</span>
-        <span id="identity-runtime">runtime —</span>
-        <span id="identity-timezone">timezone —</span>
-      </div>
-    </section>
+      <ul class="identity-strip" aria-label="Instrument identity">
+        <li id="identity-host">host —</li>
+        <li id="identity-runtime">runtime —</li>
+        <li id="identity-timezone">timezone —</li>
+      </ul>
+    </header>
 
-    <section class="hero-grid" aria-label="Primary instrument readings">
+    <section id="overview" class="hero-grid" aria-label="Primary instrument readings">
       <article id="resistance-card" class="card resistance-card quality-unknown">
         <div class="card-topline">
           <div>
@@ -54,7 +61,7 @@
         </div>
 
         <div class="resistance-reading" aria-live="polite">
-          <span id="resistance-value">—</span>
+          <output id="resistance-value" aria-label="Equivalent resistance">—</output>
           <span id="resistance-unit">Ω</span>
         </div>
 
@@ -94,11 +101,11 @@
           <dl class="alarm-times">
             <div>
               <dt>Local</dt>
-              <dd id="local-time">—</dd>
+              <dd><time id="local-time">—</time></dd>
             </div>
             <div>
               <dt>Latched</dt>
-              <dd id="latch-time">Never</dd>
+              <dd><time id="latch-time">Never</time></dd>
             </div>
           </dl>
         </article>
@@ -123,44 +130,61 @@
       </aside>
     </section>
 
-    <section class="card trend-card" aria-labelledby="trend-title">
+    <section id="trends" class="card trend-card" aria-labelledby="trend-title">
       <div class="trend-heading">
         <div>
-          <p class="eyebrow">Live history</p>
-          <h2 id="trend-title">Impedance</h2>
-          <p id="trend-subtitle" class="section-copy">Equivalent resistance and configured threshold</p>
+          <p id="trend-mode-label" class="eyebrow">Live telemetry</p>
+          <h2 id="trend-title">Correlated telemetry</h2>
+          <p id="trend-subtitle" class="section-copy">Every primary signal on one shared time range</p>
         </div>
         <div class="trend-actions">
           <label class="select-control">
-            <span>Window</span>
-            <select id="range-select" aria-label="Plot time window">
-              <option value="60">1 min</option>
-              <option value="300">5 min</option>
-              <option value="900" selected>15 min</option>
-              <option value="3600">1 hr</option>
+            <span>Mode</span>
+            <select id="mode-select" aria-label="Plot data source">
+              <option value="live" selected>Live</option>
+              <option value="history">History</option>
             </select>
           </label>
+          <label class="select-control">
+            <span>Window</span>
+            <select id="range-select" aria-label="Plot time window">
+              <option value="60" data-mode="live">1 min</option>
+              <option value="300" data-mode="live">5 min</option>
+              <option value="900" data-mode="live" selected>15 min</option>
+              <option value="3600" data-mode="both">1 hr</option>
+              <option value="21600" data-mode="history">6 hr</option>
+              <option value="86400" data-mode="history">24 hr</option>
+              <option value="604800" data-mode="history">7 days</option>
+              <option value="custom" data-mode="history">Custom</option>
+            </select>
+          </label>
+          <div id="history-range" class="history-range" hidden>
+            <label>
+              <span>From</span>
+              <input id="history-from" type="datetime-local" step="1">
+            </label>
+            <label>
+              <span>To</span>
+              <input id="history-to" type="datetime-local" step="1">
+            </label>
+          </div>
           <button id="pause-button" class="button button-secondary" type="button">Pause plot</button>
-          <button id="export-button" class="button button-primary" type="button">Export CSV</button>
+          <button id="export-button" class="button button-primary" type="button">Export all CSV</button>
         </div>
       </div>
 
-      <nav id="chart-tabs" class="chart-tabs" aria-label="Trend selection"></nav>
-
-      <div id="chart-shell" class="chart-shell">
-        <canvas id="trend-canvas" role="img" aria-label="Live GIZMo trend plot"></canvas>
-        <div id="chart-empty" class="chart-empty">
-          <span class="empty-wave" aria-hidden="true"></span>
-          <strong>Building live history</strong>
-          <span>The first points will appear as OPC UA samples arrive.</span>
-        </div>
-        <div id="chart-tooltip" class="chart-tooltip" hidden></div>
+      <div
+        id="chart-stack"
+        class="chart-stack"
+        aria-label="Synchronized GIZMo telemetry plots"
+      ></div>
+      <div class="trend-footer">
+        <p id="plot-state" class="plot-state">Live · retaining up to one hour in this browser</p>
+        <p class="sync-note">Shared time range · synchronized cursors</p>
       </div>
-      <div id="chart-legend" class="chart-legend" aria-label="Plot legend"></div>
-      <p id="plot-state" class="plot-state">Live · retaining up to one hour in this browser</p>
     </section>
 
-    <section class="status-grid">
+    <section id="systems" class="status-grid" aria-label="Instrument systems">
       <article class="card status-card" aria-labelledby="health-title">
         <div class="section-title-row">
           <div>
@@ -196,13 +220,20 @@
       <div id="services-grid" class="services-grid"></div>
     </section>
 
-    <section class="card variables-card" aria-labelledby="variables-title">
-      <div class="variables-heading">
+    <details id="variables" class="card variables-card">
+      <summary class="variables-summary">
         <div>
-          <p class="eyebrow">Canonical OPC UA model</p>
+          <p class="eyebrow">Advanced telemetry · canonical OPC UA model</p>
           <h2 id="variables-title">Variable explorer</h2>
           <p class="section-copy">Every monitored value below is read-only and carries its OPC UA status code.</p>
         </div>
+        <span class="details-control" aria-hidden="true">
+          <span class="details-closed">Open inventory</span>
+          <span class="details-open">Close inventory</span>
+        </span>
+      </summary>
+
+      <div class="variables-content">
         <div class="variable-controls">
           <label class="search-control">
             <span class="visually-hidden">Search variables</span>
@@ -215,26 +246,26 @@
             </select>
           </label>
         </div>
-      </div>
 
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th scope="col">Variable</th>
-              <th scope="col">Value</th>
-              <th scope="col">Status</th>
-              <th scope="col">Updated</th>
-            </tr>
-          </thead>
-          <tbody id="variable-table"></tbody>
-        </table>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th scope="col">Variable</th>
+                <th scope="col">Value</th>
+                <th scope="col">Status</th>
+                <th scope="col">Updated</th>
+              </tr>
+            </thead>
+            <tbody id="variable-table"></tbody>
+          </table>
+        </div>
+        <div class="table-footer">
+          <span id="variable-count">0 variables</span>
+          <span>Namespace <code>urn:fnal:gizmo</code></span>
+        </div>
       </div>
-      <div class="table-footer">
-        <span id="variable-count">0 variables</span>
-        <span>Namespace <code>urn:fnal:gizmo</code></span>
-      </div>
-    </section>
+    </details>
 
     <section class="card events-card" aria-labelledby="events-title">
       <div class="section-title-row">
@@ -251,7 +282,7 @@
   </main>
 
   <footer class="footer">
-    <span>GIZMo Kria · read-only instrument view</span>
+    <span>GIZMo Kria · read-only operations console</span>
     <span id="footer-endpoint">OPC UA endpoint —</span>
   </footer>
 

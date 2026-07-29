@@ -26,7 +26,7 @@ from gizmo_common import read_exported_int, state_path
 
 MODEL_NAMESPACE_URI = "urn:fnal:gizmo"
 LEGACY_NAMESPACE_URI = "SimpleOPCUAServer"
-MODEL_VERSION = "1.1.1"
+MODEL_VERSION = "1.3.0"
 MODEL_PUBLICATION_DATE = dt.datetime(2026, 7, 27, tzinfo=dt.timezone.utc)
 
 QUALITY_GOOD = "Good"
@@ -77,6 +77,7 @@ SYSTEMD_UNITS = (
     "gizmo-sdr.service",
     "gizmo-zmq.service",
     "gizmo-opcua.service",
+    "gizmo-historian.service",
     "gizmo-dashboard.service",
 )
 REQUIRED_UNITS = {
@@ -86,6 +87,7 @@ REQUIRED_UNITS = {
     "gizmo-control.socket",
     "gizmo-zmon.service",
     "gizmo-opcua.service",
+    "gizmo-historian.service",
     "gizmo-dashboard.service",
 }
 
@@ -126,6 +128,7 @@ class MeasurementSnapshot:
     in_phase_count: float | None = None
     quadrature_count: float | None = None
     averages_per_calculation: int = 0
+    alarm_active: bool = False
     alarm_latched: bool = False
     latch_time: dt.datetime | None = None
     alarm_reason: str = ""
@@ -498,6 +501,20 @@ def parse_legacy_measurement(
     else:
         result.capacitance_range = RANGE_IN_RANGE
 
+    active = fields.get("Alarm", "").strip().lower()
+    if "Alarm" not in fields:
+        missing.append("Alarm")
+    elif active not in {"0", "1", "false", "true", "no", "yes", "off", "on"}:
+        result.quality = QUALITY_BAD
+        result.diagnostic = (
+            f"{result.diagnostic}; " if result.diagnostic else ""
+        ) + f"invalid Alarm Boolean: {fields['Alarm']}"
+    result.alarm_active = active in {"1", "true", "yes", "on"}
+
+    if "AlarmReason" not in fields:
+        missing.append("AlarmReason")
+    result.alarm_reason = fields.get("AlarmReason", "").strip()
+
     latched = fields.get("latched", "").strip().lower()
     if "latched" not in fields:
         missing.append("latched")
@@ -511,23 +528,6 @@ def parse_legacy_measurement(
         result.diagnostic = (
             f"{result.diagnostic}; " if result.diagnostic else ""
         ) + f"invalid latch timestamp: {latch_text}"
-
-    if (
-        result.phase_interpolated_deg is not None
-        and result.phase_atan2_deg is not None
-        and result.resistance_ohm is not None
-        and result.resistance_ohm > 8
-        and abs(result.phase_interpolated_deg - result.phase_atan2_deg) > 1.5
-    ):
-        result.alarm_reason = "PhaseInterpolation"
-    elif (
-        result.resistance_ohm is not None
-        and result.threshold_ohm is not None
-        and result.resistance_ohm < result.threshold_ohm
-    ):
-        result.alarm_reason = "ResistanceThreshold"
-    elif result.alarm_latched:
-        result.alarm_reason = "HistoricalLatch"
 
     if missing:
         result.quality = QUALITY_BAD

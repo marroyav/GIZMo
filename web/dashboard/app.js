@@ -2,19 +2,23 @@
   "use strict";
 
   const COLORS = [
-    "#087f68",
-    "#1868d5",
-    "#d17900",
-    "#7656c7",
-    "#d14f52",
-    "#1f9bb3",
+    "#b8c41f",
+    "#4f7f86",
+    "#8d7fb8",
+    "#c39a4a",
+    "#56836c",
+    "#876f62",
   ];
-  const HIGH_Z_COLOR = "#1868d5";
-  const THRESHOLD_COLOR = "#7d8883";
+  const HIGH_Z_COLOR = "#b8c41f";
+  const NORMAL_COLOR = "#b8c41f";
+  const ALARM_COLOR = "#ff6a2a";
+  const THRESHOLD_COLOR = "#747d86";
   const HIGH_Z_SERIES_PATH = "__display.high_z_floor__";
   const MAX_HISTORY_SECONDS = 3600;
+  const HISTORY_MAX_POINTS = 5000;
   const MAX_EVENTS = 24;
   const VIEW_COPY = {
+    alarm: "Authoritative composite relay/beacon alarm from the ZMon engine",
     impedance: "Equivalent resistance, HIGH Z floor, and configured threshold",
     thermal: "Chassis and processor thermal sensors",
     lockin: "Lock-in magnitude and orthogonal components",
@@ -63,15 +67,15 @@
     pulseGrid: byId("pulse-grid"),
     trendTitle: byId("trend-title"),
     trendSubtitle: byId("trend-subtitle"),
+    trendModeLabel: byId("trend-mode-label"),
+    modeSelect: byId("mode-select"),
     rangeSelect: byId("range-select"),
+    historyRange: byId("history-range"),
+    historyFrom: byId("history-from"),
+    historyTo: byId("history-to"),
     pauseButton: byId("pause-button"),
     exportButton: byId("export-button"),
-    chartTabs: byId("chart-tabs"),
-    chartShell: byId("chart-shell"),
-    canvas: byId("trend-canvas"),
-    chartEmpty: byId("chart-empty"),
-    chartTooltip: byId("chart-tooltip"),
-    chartLegend: byId("chart-legend"),
+    chartStack: byId("chart-stack"),
     plotState: byId("plot-state"),
     healthGrid: byId("health-grid"),
     healthSummary: byId("health-summary"),
@@ -79,6 +83,7 @@
     networkSummary: byId("network-summary"),
     servicesGrid: byId("services-grid"),
     servicesSummary: byId("services-summary"),
+    variableDetails: byId("variables"),
     variableSearch: byId("variable-search"),
     groupSelect: byId("group-select"),
     variableTable: byId("variable-table"),
@@ -95,8 +100,17 @@
     serviceUnits: [],
     snapshot: null,
     samples: [],
-    activeViewId: "impedance",
+    historySamples: [],
+    plotMode: "live",
+    historyAvailable: false,
+    historyLoading: false,
+    historyResolution: null,
+    historyFromMs: null,
+    historyToMs: null,
+    historyRequest: 0,
     customView: null,
+    chartPanels: new Map(),
+    hoverViewId: null,
     windowSeconds: Number(dom.rangeSelect.value),
     paused: false,
     streamOpen: false,
@@ -137,6 +151,11 @@
 
   function boolean(path) {
     return typeof raw(path) === "boolean" ? raw(path) : null;
+  }
+
+  function numericPlotValue(value) {
+    if (typeof value === "boolean") return value ? 1 : 0;
+    return typeof value === "number" && Number.isFinite(value) ? value : null;
   }
 
   function statusClass(value) {
@@ -256,9 +275,182 @@
     return unit.replace(/[^A-Za-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
   }
 
-  function activeView() {
-    if (state.activeViewId === "custom" && state.customView) return state.customView;
-    return state.views.find((view) => view.id === state.activeViewId) || state.views[0];
+  function plotViews() {
+    return state.customView ? [...state.views, state.customView] : state.views;
+  }
+
+  function plotPaths() {
+    return [...new Set(plotViews().flatMap((view) => view.paths))];
+  }
+
+  function setChartEmptyCopy(title, copy) {
+    state.chartPanels.forEach((panel) => {
+      panel.emptyTitle.textContent = title;
+      panel.emptyCopy.textContent = copy;
+    });
+  }
+
+  function activeSamples() {
+    return state.plotMode === "history" ? state.historySamples : state.samples;
+  }
+
+  function localInputValue(timestamp) {
+    const date = new Date(timestamp);
+    return new Date(date.getTime() - date.getTimezoneOffset() * 60000)
+      .toISOString()
+      .slice(0, 19);
+  }
+
+  function initializeHistoryInputs() {
+    const end = Date.now();
+    dom.historyTo.value = localInputValue(end);
+    dom.historyFrom.value = localInputValue(end - 3600 * 1000);
+  }
+
+  function updateRangeOptions() {
+    const history = state.plotMode === "history";
+    [...dom.rangeSelect.options].forEach((option) => {
+      const supported =
+        option.dataset.mode === "both" ||
+        option.dataset.mode === (history ? "history" : "live");
+      option.hidden = !supported;
+      option.disabled = !supported;
+    });
+    const selected = dom.rangeSelect.selectedOptions[0];
+    if (!selected || selected.disabled) {
+      dom.rangeSelect.value = history ? "3600" : "900";
+    }
+    const custom = history && dom.rangeSelect.value === "custom";
+    dom.historyRange.hidden = !custom;
+    if (!custom) {
+      state.windowSeconds = Number(dom.rangeSelect.value);
+    }
+  }
+
+  function historyBounds() {
+    if (dom.rangeSelect.value === "custom") {
+      const start = new Date(dom.historyFrom.value).getTime();
+      const end = new Date(dom.historyTo.value).getTime();
+      if (!Number.isFinite(start) || !Number.isFinite(end)) {
+        throw new Error("Choose valid From and To times.");
+      }
+      if (end <= start) throw new Error("History To must be later than From.");
+      return { start, end };
+    }
+    const end = Date.now();
+    const seconds = Number(dom.rangeSelect.value);
+    return { start: end - seconds * 1000, end };
+  }
+
+  function plotDomain(samples = activeSamples()) {
+    if (
+      state.plotMode === "history" &&
+      state.historyFromMs !== null &&
+      state.historyToMs !== null
+    ) {
+      return {
+        start: state.historyFromMs,
+        end: state.historyToMs,
+        duration: state.historyToMs - state.historyFromMs,
+      };
+    }
+    const end = samples.at(-1)?.time || Date.now();
+    return {
+      start: end - state.windowSeconds * 1000,
+      end,
+      duration: state.windowSeconds * 1000,
+    };
+  }
+
+  async function loadHistory() {
+    if (state.plotMode !== "history") return;
+    const paths = plotPaths();
+    if (!paths.length) return;
+    const requestId = ++state.historyRequest;
+    state.historyLoading = true;
+    dom.pauseButton.disabled = true;
+    dom.pauseButton.textContent = "Loading…";
+    setChartEmptyCopy(
+      "Loading persistent history",
+      "Querying the package-owned historian.",
+    );
+    dom.plotState.textContent = "Historical query in progress…";
+    try {
+      const { start, end } = historyBounds();
+      const parameters = new URLSearchParams({
+        series: paths.join(","),
+        from: new Date(start).toISOString(),
+        to: new Date(end).toISOString(),
+        max_points: String(HISTORY_MAX_POINTS),
+      });
+      const response = await fetch(`/api/history/query?${parameters}`, {
+        cache: "no-store",
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.error || `history request returned ${response.status}`);
+      }
+      if (requestId !== state.historyRequest) return;
+      state.historySamples = payload.points.map((point) => ({
+        time: Number(point.time),
+        sequence: point.sequence,
+        values: point.values || {},
+        resistanceRange: point.resistanceRange,
+        resistanceRangeStatus: point.resistanceRangeStatus,
+      }));
+      state.historyResolution = payload.resolution;
+      state.historyFromMs = Date.parse(payload.from);
+      state.historyToMs = Date.parse(payload.to);
+      state.windowSeconds = Math.max(
+        1,
+        (state.historyToMs - state.historyFromMs) / 1000,
+      );
+      setChartEmptyCopy(
+        "No retained samples",
+        "The historian has no data in this interval for these series.",
+      );
+      addEvent(
+        `Loaded ${payload.point_count} ${payload.resolution} historical points.`,
+      );
+    } catch (error) {
+      if (requestId !== state.historyRequest) return;
+      state.historySamples = [];
+      state.historyResolution = null;
+      state.historyFromMs = null;
+      state.historyToMs = null;
+      setChartEmptyCopy("History unavailable", error.message);
+      dom.plotState.textContent = `History unavailable · ${error.message}`;
+      addEvent(`Historical query failed: ${error.message}`, "error");
+    } finally {
+      if (requestId === state.historyRequest) {
+        state.historyLoading = false;
+        dom.pauseButton.disabled = false;
+        dom.pauseButton.textContent = "Refresh history";
+        scheduleDraw();
+      }
+    }
+  }
+
+  function setPlotMode(mode) {
+    state.plotMode = mode === "history" ? "history" : "live";
+    dom.modeSelect.value = state.plotMode;
+    dom.trendModeLabel.textContent =
+      state.plotMode === "history" ? "Persistent history" : "Live telemetry";
+    dom.pauseButton.classList.remove("is-active");
+    dom.pauseButton.textContent =
+      state.plotMode === "history"
+        ? "Refresh history"
+        : state.paused
+          ? "Resume plot"
+          : "Pause plot";
+    updateRangeOptions();
+    renderChartHeading();
+    hideTooltip();
+    if (state.plotMode === "history") {
+      loadHistory();
+    } else {
+      scheduleDraw();
+    }
   }
 
   function addEvent(message, kind = "info") {
@@ -371,33 +563,46 @@
     const active = boolean("Alarm.Active");
     const latched = boolean("Alarm.Latched");
     const reason = raw("Alarm.Reason");
-    const alarm = active === true || latched === true;
+    const activeAlarm = active === true;
+    const latchedAlarm = latched === true;
+    document.body.classList.toggle("has-alarm", activeAlarm);
     dom.alarmCard.className = `card alarm-card ${
-      active === null && latched === null ? "state-unknown" : alarm ? "state-alarm" : "state-clear"
+      active === null && latched === null
+        ? "state-unknown"
+        : activeAlarm
+          ? "state-alarm"
+          : latchedAlarm
+            ? "state-clear state-latched"
+            : "state-clear"
     }`;
-    dom.alarmTitle.textContent = alarm
-      ? active
-        ? "Threshold alarm active"
-        : "Alarm remains latched"
+    dom.alarmTitle.textContent = activeAlarm
+      ? "Composite alarm active"
+      : latchedAlarm
+        ? "Alarm remains latched"
       : active === null
         ? "Establishing state"
         : "Ground path normal";
     dom.alarmReason.textContent = reason
       ? humanize(reason)
-      : alarm
-        ? "Inspect the monitored ground path."
+      : activeAlarm
+        ? "ZMon has asserted the relay/beacon alarm output."
+        : latchedAlarm
+          ? "Historical latch retained; no alarm is currently active."
         : "No threshold alarm is active.";
     dom.localTime.textContent = formatDateTime(raw("Time.CurrentLocal"), false);
     dom.latchTime.textContent = latched
       ? formatDateTime(raw("Alarm.LatchTime"))
       : "Never";
-    transition("alarm", alarm, (next) =>
+    transition("alarm-active", activeAlarm, (next) =>
       next ? "Ground impedance alarm asserted." : "Ground impedance alarm cleared.",
+    );
+    transition("alarm-latched", latchedAlarm, (next) =>
+      next ? "Ground alarm latch retained." : "Ground alarm latch cleared.",
     );
   }
 
-  function pulseItem(label, value, detail = "") {
-    const item = element("div", "pulse-item");
+  function pulseItem(label, value, detail = "", quality = "Unknown") {
+    const item = element("div", `pulse-item ${statusClass(quality)}`);
     item.append(element("span", "", label), element("strong", "", value));
     if (detail) item.title = detail;
     return item;
@@ -416,6 +621,8 @@
         number("Thermal.ChassisTemperatureCelsius") === null
           ? "—"
           : `${formatNumber(number("Thermal.ChassisTemperatureCelsius"), 1)} °C`,
+        "",
+        raw("Health.Thermal"),
       ),
       pulseItem(
         "CPU",
@@ -423,20 +630,34 @@
           ? "—"
           : `${formatNumber(number("OperatingSystem.CpuUtilizationPercent"), 1)}%`,
         `Load 1m: ${formatNumber(number("OperatingSystem.Load1Minute"), 2)}`,
+        raw("Health.OperatingSystem"),
       ),
       pulseItem(
         "Memory",
         memoryPercent === null ? "—" : `${formatNumber(memoryPercent, 1)}%`,
         `${formatBytes(memoryUsed)} of ${formatBytes(memoryTotal)}`,
+        raw("Health.OperatingSystem"),
       ),
       pulseItem(
         "Root disk",
         number("Storage.Filesystems.Root.UsedPercent") === null
           ? "—"
           : `${formatNumber(number("Storage.Filesystems.Root.UsedPercent"), 1)}%`,
+        "",
+        raw("Health.Storage"),
       ),
-      pulseItem("Clock", ntp === null ? "—" : ntp ? "NTP synced" : "Unsynced"),
-      pulseItem("FPGA", overlay === null ? "—" : overlay ? "Overlay up" : "Not loaded"),
+      pulseItem(
+        "Clock",
+        ntp === null ? "—" : ntp ? "NTP synced" : "Unsynced",
+        "",
+        raw("Health.Time"),
+      ),
+      pulseItem(
+        "FPGA",
+        overlay === null ? "—" : overlay ? "Overlay up" : "Not loaded",
+        "",
+        raw("Health.Firmware"),
+      ),
     );
     setChip(dom.overallHealth, raw("Health.Overall") || "Unknown");
   }
@@ -453,6 +674,10 @@
     });
     dom.healthGrid.replaceChildren(...nodes);
     dom.healthSummary.textContent = `${good}/${HEALTH_PATHS.length} good`;
+    document.body.classList.toggle(
+      "has-system-warning",
+      good < HEALTH_PATHS.length,
+    );
   }
 
   function renderNetwork() {
@@ -596,26 +821,69 @@
     dom.variableCount.textContent = `${visible} of ${state.catalog.length} variables`;
   }
 
-  function buildChartTabs() {
-    const views = state.customView ? [...state.views, state.customView] : state.views;
-    const buttons = views.map((view) => {
-      const button = element(
-        "button",
-        `chart-tab ${view.id === state.activeViewId ? "active" : ""}`,
-        view.label,
+  function buildChartPanels() {
+    state.chartPanels.clear();
+    const panels = plotViews().map((view) => {
+      const article = element("article", "chart-panel");
+      article.dataset.view = view.id;
+      const titleId = `chart-title-${view.id}`;
+      article.setAttribute("aria-labelledby", titleId);
+
+      const heading = element("header", "chart-panel-header");
+      const copy = element("div", "chart-panel-copy");
+      const title = element("h3", "", view.label);
+      title.id = titleId;
+      copy.append(
+        title,
+        element(
+          "p",
+          "",
+          VIEW_COPY[view.id] ||
+            state.specs.get(view.paths[0])?.description ||
+            `${view.label} telemetry`,
+        ),
       );
-      button.type = "button";
-      button.dataset.view = view.id;
-      button.setAttribute("aria-pressed", String(view.id === state.activeViewId));
-      button.addEventListener("click", () => {
-        state.activeViewId = view.id;
-        buildChartTabs();
-        renderChartHeading();
-        scheduleDraw();
+      const legend = element("div", "chart-legend");
+      legend.setAttribute("aria-label", `${view.label} plot legend`);
+      heading.append(copy, legend);
+
+      const shell = element("div", "chart-shell");
+      const canvas = element("canvas", "trend-canvas");
+      canvas.setAttribute("role", "img");
+      canvas.setAttribute("aria-label", `${view.label} time-series plot`);
+      const empty = element("div", "chart-empty");
+      const wave = element("span", "empty-wave");
+      wave.setAttribute("aria-hidden", "true");
+      const emptyTitle = element("strong", "", "Building live history");
+      const emptyCopy = element(
+        "span",
+        "",
+        "The first points will appear as OPC UA samples arrive.",
+      );
+      empty.append(wave, emptyTitle, emptyCopy);
+      const tooltip = element("div", "chart-tooltip");
+      tooltip.hidden = true;
+      shell.append(canvas, empty, tooltip);
+      article.append(heading, shell);
+
+      const panel = {
+        article,
+        shell,
+        canvas,
+        empty,
+        emptyTitle,
+        emptyCopy,
+        tooltip,
+        legend,
+      };
+      state.chartPanels.set(view.id, panel);
+      canvas.addEventListener("mousemove", (event) => {
+        showTooltip(event, view, panel);
       });
-      return button;
+      canvas.addEventListener("mouseleave", hideTooltip);
+      return article;
     });
-    dom.chartTabs.replaceChildren(...buttons);
+    dom.chartStack.replaceChildren(...panels);
   }
 
   function selectCustomView(spec) {
@@ -625,19 +893,20 @@
       unit: spec.unit,
       paths: [spec.path],
     };
-    state.activeViewId = "custom";
-    buildChartTabs();
-    renderChartHeading();
-    scheduleDraw();
-    dom.chartShell.scrollIntoView({ behavior: "smooth", block: "center" });
+    buildChartPanels();
+    if (state.plotMode === "history") loadHistory();
+    else scheduleDraw();
+    state.chartPanels
+      .get("custom")
+      ?.article.scrollIntoView({ behavior: "smooth", block: "center" });
   }
 
   function renderChartHeading() {
-    const view = activeView();
-    if (!view) return;
-    dom.trendTitle.textContent = view.label;
+    dom.trendTitle.textContent = "Correlated telemetry";
     dom.trendSubtitle.textContent =
-      VIEW_COPY[view.id] || state.specs.get(view.paths[0])?.description || `Live ${view.label.toLowerCase()} history`;
+      state.plotMode === "history"
+        ? "All primary signals · retained SQLite record · shared time range"
+        : "Every primary signal on one shared time range";
   }
 
   function ingestSample(snapshot) {
@@ -649,9 +918,7 @@
       if (!spec.chartable) return;
       const payload = snapshot.values?.[spec.path];
       values[spec.path] = {
-        value: typeof payload?.value === "number" && Number.isFinite(payload.value)
-          ? payload.value
-          : null,
+        value: numericPlotValue(payload?.value),
         status: payload?.status || "BadWaitingForInitialData",
       };
     });
@@ -699,24 +966,32 @@
     state.drawPending = true;
     requestAnimationFrame(() => {
       state.drawPending = false;
-      drawChart();
+      drawCharts();
     });
   }
 
   function seriesForView(view, samples) {
-    const series = view.paths.map((path, index) => ({
-      path,
-      spec: state.specs.get(path),
-      color:
-        view.id === "impedance" && path.includes("Threshold")
-          ? THRESHOLD_COLOR
-          : COLORS[index % COLORS.length],
-      points: samples.map((sample) => ({
-        time: sample.time,
-        value: sample.values[path]?.value,
-        status: sample.values[path]?.status,
-      })),
-    }));
+    const series = view.paths.map((path, index) => {
+      const spec = state.specs.get(path);
+      const alarmBoolean = view.id === "alarm" && path === "Alarm.Active";
+      return {
+        path,
+        spec,
+        alarmBoolean,
+        color:
+          alarmBoolean
+            ? NORMAL_COLOR
+            : view.id === "impedance" && path.includes("Threshold")
+              ? THRESHOLD_COLOR
+              : COLORS[index % COLORS.length],
+        points: samples.map((sample) => ({
+          time: sample.time,
+          value: numericPlotValue(sample.values[path]?.value),
+          status: sample.values[path]?.status,
+          aggregate: sample.values[path]?.aggregate,
+        })),
+      };
+    });
     if (
       view.id === "impedance" &&
       samples.some((sample) => sample.resistanceRange === "OutOfRange")
@@ -745,24 +1020,85 @@
   }
 
   function formatSeriesValue(item, point) {
-    if (!point || point.value === null || !plotStatusIsUsable(point.status)) {
+    if (
+      !point ||
+      !Number.isFinite(point.value) ||
+      !plotStatusIsUsable(point.status)
+    ) {
       return "—";
     }
     if (item.highZ) return `> ${formatNumber(state.highZFloorOhm, 0)} Ω`;
+    if (item.alarmBoolean) {
+      return alarmPointAsserted(point) ? "ALARM" : "NORMAL";
+    }
     return `${formatNumber(point.value, item.spec?.precision ?? 1)}${
       item.spec?.unit ? ` ${item.spec.unit}` : ""
     }`;
   }
 
-  function drawChart() {
-    const view = activeView();
-    if (!view) return;
-    const rect = dom.canvas.getBoundingClientRect();
+  function alarmPointAsserted(point) {
+    const maximum = numericPlotValue(point?.aggregate?.maximum);
+    return (maximum ?? point?.value ?? 0) > 0;
+  }
+
+  function drawAlarmTrace(context, item, x, y, start, gapLimit) {
+    let previous = null;
+    item.points.forEach((point) => {
+      const usable =
+        Number.isFinite(point.value) &&
+        plotStatusIsUsable(point.status) &&
+        point.time >= start;
+      if (!usable) {
+        previous = null;
+        return;
+      }
+      const pointX = x(point.time);
+      const pointY = y(point.value);
+      const color = alarmPointAsserted(point) ? ALARM_COLOR : NORMAL_COLOR;
+      if (
+        previous &&
+        point.time - previous.time <= gapLimit
+      ) {
+        const previousColor = alarmPointAsserted(previous)
+          ? ALARM_COLOR
+          : NORMAL_COLOR;
+        context.strokeStyle = previousColor;
+        context.beginPath();
+        context.moveTo(x(previous.time), y(previous.value));
+        context.lineTo(pointX, y(previous.value));
+        context.stroke();
+        if (point.value !== previous.value) {
+          context.strokeStyle = color;
+          context.beginPath();
+          context.moveTo(pointX, y(previous.value));
+          context.lineTo(pointX, pointY);
+          context.stroke();
+        }
+      } else {
+        context.fillStyle = color;
+        context.beginPath();
+        context.arc(pointX, pointY, 2.2, 0, Math.PI * 2);
+        context.fill();
+      }
+      previous = point;
+    });
+  }
+
+  function drawCharts() {
+    plotViews().forEach((view) => {
+      const panel = state.chartPanels.get(view.id);
+      if (panel) drawChart(view, panel);
+    });
+    renderPlotState();
+  }
+
+  function drawChart(view, panel) {
+    const rect = panel.canvas.getBoundingClientRect();
     if (!rect.width || !rect.height) return;
     const ratio = Math.min(window.devicePixelRatio || 1, 2);
-    dom.canvas.width = Math.round(rect.width * ratio);
-    dom.canvas.height = Math.round(rect.height * ratio);
-    const context = dom.canvas.getContext("2d");
+    panel.canvas.width = Math.round(rect.width * ratio);
+    panel.canvas.height = Math.round(rect.height * ratio);
+    const context = panel.canvas.getContext("2d");
     context.scale(ratio, ratio);
 
     const width = rect.width;
@@ -770,26 +1106,35 @@
     const padding = { left: 58, right: 20, top: 22, bottom: 35 };
     const plotWidth = width - padding.left - padding.right;
     const plotHeight = height - padding.top - padding.bottom;
-    const latest = state.samples.at(-1)?.time || Date.now();
-    const start = latest - state.windowSeconds * 1000;
-    const samples = state.samples.filter((sample) => sample.time >= start);
+    const retained = activeSamples();
+    const domain = plotDomain(retained);
+    const { start, end, duration } = domain;
+    const samples = retained.filter(
+      (sample) => sample.time >= start && sample.time <= end,
+    );
     const series = seriesForView(view, samples);
     const numeric = series.flatMap((item) =>
       item.points
-        .filter((point) => point.value !== null && plotStatusIsUsable(point.status))
+        .filter(
+          (point) =>
+            Number.isFinite(point.value) && plotStatusIsUsable(point.status),
+        )
         .map((point) => point.value),
     );
 
     context.clearRect(0, 0, width, height);
-    dom.chartEmpty.hidden = numeric.length > 0;
+    panel.empty.hidden = numeric.length > 0;
     if (!numeric.length) {
-      renderLegend(series);
+      renderLegend(panel, series);
       return;
     }
 
     let minValue = Math.min(...numeric);
     let maxValue = Math.max(...numeric);
-    if (view.id === "system") {
+    if (view.id === "alarm") {
+      minValue = 0;
+      maxValue = 1;
+    } else if (view.id === "system") {
       minValue = 0;
       maxValue = Math.max(100, maxValue);
     } else {
@@ -801,64 +1146,110 @@
     if (minValue === maxValue) maxValue = minValue + 1;
     const valueSpan = maxValue - minValue;
     const x = (timestamp) =>
-      padding.left + ((timestamp - start) / (state.windowSeconds * 1000)) * plotWidth;
+      padding.left + ((timestamp - start) / duration) * plotWidth;
     const y = (value) =>
       padding.top + (1 - (value - minValue) / valueSpan) * plotHeight;
 
     context.lineWidth = 1;
-    context.font = "10px ui-monospace, SFMono-Regular, Consolas, monospace";
+    context.font =
+      "10px 'JetBrains Mono', ui-monospace, SFMono-Regular, Consolas, monospace";
     context.textBaseline = "middle";
     for (let index = 0; index <= 5; index += 1) {
       const gridY = padding.top + (plotHeight / 5) * index;
       const value = maxValue - (valueSpan / 5) * index;
-      context.strokeStyle = "#e4e9e5";
+      context.strokeStyle = "#3f464d";
       context.beginPath();
       context.moveTo(padding.left, gridY);
       context.lineTo(width - padding.right, gridY);
       context.stroke();
-      context.fillStyle = "#7d8883";
+      context.fillStyle = "#929aa1";
       context.textAlign = "right";
-      context.fillText(formatAxis(value, valueSpan), padding.left - 9, gridY);
+      const label = view.id === "alarm"
+        ? index === 0
+          ? "ALARM"
+          : index === 5
+            ? "NORMAL"
+            : ""
+        : formatAxis(value, valueSpan);
+      if (label) context.fillText(label, padding.left - 9, gridY);
     }
     for (let index = 0; index <= 4; index += 1) {
       const gridX = padding.left + (plotWidth / 4) * index;
-      const timestamp = start + (state.windowSeconds * 1000 / 4) * index;
-      context.strokeStyle = "#edf0ee";
+      const timestamp = start + (duration / 4) * index;
+      context.strokeStyle = "#30353a";
       context.beginPath();
       context.moveTo(gridX, padding.top);
       context.lineTo(gridX, height - padding.bottom);
       context.stroke();
-      context.fillStyle = "#7d8883";
+      context.fillStyle = "#929aa1";
       context.textAlign = index === 0 ? "left" : index === 4 ? "right" : "center";
       context.fillText(
-        new Intl.DateTimeFormat(undefined, {
-          hour: "2-digit",
-          minute: "2-digit",
-          second: state.windowSeconds <= 300 ? "2-digit" : undefined,
-        }).format(timestamp),
+        new Intl.DateTimeFormat(
+          undefined,
+          duration >= 86400 * 1000
+            ? {
+                month: "short",
+                day: "numeric",
+                hour: "2-digit",
+                minute: "2-digit",
+              }
+            : {
+                hour: "2-digit",
+                minute: "2-digit",
+                second: duration <= 300 * 1000 ? "2-digit" : undefined,
+              },
+        ).format(timestamp),
         gridX,
         height - 17,
       );
     }
 
     series.forEach((item, index) => {
+      const rollupMatch = String(state.historyResolution || "").match(
+        /^([0-9]+)-minute/,
+      );
+      const rollupMinutes = state.historyResolution === "one-minute rollup"
+        ? 1
+        : Number(rollupMatch?.[1] || 0);
+      const slowRaw =
+        state.plotMode === "history" &&
+        state.historyResolution === "raw" &&
+        !item.path.startsWith("Measurement.") &&
+        !item.path.startsWith("Thermal.") &&
+        item.path !== "Time.UptimeSeconds" &&
+        item.path !== "SDR.FrameSequence";
+      const gapLimit = rollupMinutes
+        ? rollupMinutes * 60 * 1000 * 2.5
+        : slowRaw
+          ? 30000
+          : 5000;
       context.strokeStyle = item.color;
       context.lineWidth = item.lineWidth || (index === 0 ? 2.2 : 1.7);
       context.lineJoin = "round";
       context.lineCap = "round";
       context.setLineDash(item.path.includes("Threshold") ? [6, 5] : []);
+      if (item.alarmBoolean) {
+        drawAlarmTrace(context, item, x, y, start, gapLimit);
+        context.setLineDash([]);
+        return;
+      }
       context.beginPath();
       let drawing = false;
       let previousTime = null;
       item.points.forEach((point) => {
         const usable =
-          point.value !== null &&
+          Number.isFinite(point.value) &&
           plotStatusIsUsable(point.status) &&
           point.time >= start;
-        const gap = previousTime !== null && point.time - previousTime > 5000;
+        const gap =
+          previousTime !== null && point.time - previousTime > gapLimit;
         if (!usable) {
-          drawing = false;
-          previousTime = null;
+          const absentSlowSample =
+            slowRaw && point.value == null && point.status == null;
+          if (!absentSlowSample) {
+            drawing = false;
+            previousTime = null;
+          }
           return;
         }
         const pointX = x(point.time);
@@ -879,7 +1270,8 @@
     if (highZSeries) {
       const highZY = y(state.highZFloorOhm);
       context.fillStyle = HIGH_Z_COLOR;
-      context.font = "700 10px ui-monospace, SFMono-Regular, Consolas, monospace";
+      context.font =
+        "700 10px 'JetBrains Mono', ui-monospace, SFMono-Regular, Consolas, monospace";
       context.textAlign = "right";
       context.fillText(
         formatNumber(state.highZFloorOhm, 0),
@@ -891,7 +1283,7 @@
     if (state.hoverTime !== null) {
       const hoverX = x(state.hoverTime);
       if (hoverX >= padding.left && hoverX <= width - padding.right) {
-        context.strokeStyle = "#9aa59f";
+        context.strokeStyle = "#b8c41f";
         context.lineWidth = 1;
         context.setLineDash([3, 3]);
         context.beginPath();
@@ -901,17 +1293,25 @@
         context.setLineDash([]);
       }
     }
-    renderLegend(series);
+    renderLegend(panel, series);
   }
 
-  function renderLegend(series) {
+  function renderLegend(panel, series) {
     const nodes = series.map((item) => {
       const container = element("span", "legend-item");
       const swatch = element("i", "legend-swatch");
-      swatch.style.backgroundColor = item.color;
       const latest = [...item.points]
         .reverse()
-        .find((point) => point.value !== null && plotStatusIsUsable(point.status));
+        .find(
+          (point) =>
+            Number.isFinite(point.value) && plotStatusIsUsable(point.status),
+        );
+      swatch.style.backgroundColor =
+        item.alarmBoolean && latest
+          ? alarmPointAsserted(latest)
+            ? ALARM_COLOR
+            : NORMAL_COLOR
+          : item.color;
       const value = formatSeriesValue(item, latest);
       container.append(
         swatch,
@@ -920,36 +1320,56 @@
       );
       return container;
     });
-    dom.chartLegend.replaceChildren(...nodes);
-    const highZNote = series.some((item) => item.highZ)
+    panel.legend.replaceChildren(...nodes);
+  }
+
+  function renderPlotState() {
+    const highZNote = activeSamples().some(
+      (sample) => sample.resistanceRange === "OutOfRange",
+    )
       ? ` · HIGH Z clipped to ${formatNumber(state.highZFloorOhm, 0)} Ω`
       : "";
+    if (state.plotMode === "history") {
+      if (state.historyLoading) {
+        dom.plotState.textContent = "Historical query in progress…";
+      } else if (state.historyResolution) {
+        dom.plotState.textContent =
+          `History · ${state.historyResolution} · ` +
+          `${state.historySamples.length} points${highZNote}`;
+      }
+      return;
+    }
     dom.plotState.textContent = state.paused
       ? `Plot paused · ${state.samples.length} samples retained${highZNote}`
       : `Live · ${state.samples.length} samples retained in this browser${highZNote}`;
   }
 
-  function showTooltip(event) {
-    const view = activeView();
-    if (!view || !state.samples.length) return;
-    const rect = dom.canvas.getBoundingClientRect();
+  function showTooltip(event, view, panel) {
+    const retained = activeSamples();
+    if (!retained.length) return;
+    const rect = panel.canvas.getBoundingClientRect();
     const padding = { left: 58, right: 20 };
     const plotWidth = rect.width - padding.left - padding.right;
     const fraction = Math.max(
       0,
       Math.min(1, (event.clientX - rect.left - padding.left) / plotWidth),
     );
-    const latest = state.samples.at(-1).time;
-    const start = latest - state.windowSeconds * 1000;
-    const target = start + fraction * state.windowSeconds * 1000;
-    const candidate = state.samples.reduce((nearest, sample) =>
+    const domain = plotDomain(retained);
+    const target = domain.start + fraction * domain.duration;
+    const candidate = retained.reduce((nearest, sample) =>
       Math.abs(sample.time - target) < Math.abs(nearest.time - target) ? sample : nearest,
     );
     state.hoverTime = candidate.time;
+    state.hoverViewId = view.id;
+    state.chartPanels.forEach((candidatePanel, viewId) => {
+      if (viewId !== view.id) candidatePanel.tooltip.hidden = true;
+    });
 
     const content = document.createDocumentFragment();
     content.append(element("time", "", formatDateTime(candidate.time)));
-    const visibleSamples = state.samples.filter((sample) => sample.time >= start);
+    const visibleSamples = retained.filter(
+      (sample) => sample.time >= domain.start && sample.time <= domain.end,
+    );
     seriesForView(view, visibleSamples).forEach((item) => {
       const payload = item.highZ
         ? {
@@ -968,46 +1388,63 @@
       row.append(label, element("strong", "", formatSeriesValue(item, payload)));
       content.append(row);
     });
-    dom.chartTooltip.replaceChildren(content);
-    dom.chartTooltip.hidden = false;
+    panel.tooltip.replaceChildren(content);
+    panel.tooltip.hidden = false;
     const tooltipWidth = 210;
     const localX = event.clientX - rect.left;
-    dom.chartTooltip.style.left = `${Math.min(rect.width - tooltipWidth, Math.max(8, localX + 12))}px`;
-    dom.chartTooltip.style.top = `${Math.max(8, event.clientY - rect.top - 30)}px`;
+    panel.tooltip.style.left = `${Math.min(rect.width - tooltipWidth, Math.max(8, localX + 12))}px`;
+    panel.tooltip.style.top = `${Math.max(8, event.clientY - rect.top - 30)}px`;
     scheduleDraw();
   }
 
   function hideTooltip() {
     state.hoverTime = null;
-    dom.chartTooltip.hidden = true;
+    state.hoverViewId = null;
+    state.chartPanels.forEach((panel) => {
+      panel.tooltip.hidden = true;
+    });
     scheduleDraw();
   }
 
   function exportCsv() {
-    const view = activeView();
-    if (!view) return;
-    const includeResistanceRange = view.id === "impedance";
+    const paths = plotPaths();
+    if (!paths.length) return;
+    if (state.plotMode === "history") {
+      try {
+        const { start, end } = historyBounds();
+        const parameters = new URLSearchParams({
+          series: paths.join(","),
+          from: new Date(start).toISOString(),
+          to: new Date(end).toISOString(),
+        });
+        const link = document.createElement("a");
+        link.href = `/api/history/export.csv?${parameters}`;
+        link.download =
+          `gizmo-history-all-${new Date().toISOString().replaceAll(":", "-")}.csv`;
+        link.click();
+        addEvent("Requested historical all-series CSV export.");
+      } catch (error) {
+        addEvent(`Historical export failed: ${error.message}`, "error");
+      }
+      return;
+    }
     const latest = state.samples.at(-1)?.time || Date.now();
     const cutoff = latest - state.windowSeconds * 1000;
     const rows = state.samples
       .filter((sample) => sample.time >= cutoff)
       .map((sample) => [
         new Date(sample.time).toISOString(),
-        ...view.paths.map((path) => sample.values[path]?.value ?? ""),
-        ...(includeResistanceRange ? [sample.resistanceRange ?? ""] : []),
-        ...view.paths.map((path) => sample.values[path]?.status ?? ""),
-        ...(includeResistanceRange
-          ? [sample.resistanceRangeStatus ?? ""]
-          : []),
+        ...paths.map((path) => sample.values[path]?.value ?? ""),
+        sample.resistanceRange ?? "",
+        ...paths.map((path) => sample.values[path]?.status ?? ""),
+        sample.resistanceRangeStatus ?? "",
       ]);
     const headers = [
       "timestamp_utc",
-      ...view.paths,
-      ...(includeResistanceRange ? ["Measurement.ResistanceRange"] : []),
-      ...view.paths.map((path) => `${path}.StatusCode`),
-      ...(includeResistanceRange
-        ? ["Measurement.ResistanceRange.StatusCode"]
-        : []),
+      ...paths,
+      "Measurement.ResistanceRange",
+      ...paths.map((path) => `${path}.StatusCode`),
+      "Measurement.ResistanceRange.StatusCode",
     ];
     const csv = [headers, ...rows]
       .map((row) =>
@@ -1022,13 +1459,17 @@
     const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
     const link = document.createElement("a");
     link.href = URL.createObjectURL(blob);
-    link.download = `gizmo-${view.id}-${new Date().toISOString().replaceAll(":", "-")}.csv`;
+    link.download = `gizmo-all-${new Date().toISOString().replaceAll(":", "-")}.csv`;
     link.click();
     URL.revokeObjectURL(link.href);
-    addEvent(`Exported ${rows.length} ${view.label.toLowerCase()} samples to CSV.`);
+    addEvent(`Exported ${rows.length} all-series samples to CSV.`);
   }
 
   function togglePause() {
+    if (state.plotMode === "history") {
+      loadHistory();
+      return;
+    }
     state.paused = !state.paused;
     dom.pauseButton.textContent = state.paused ? "Resume plot" : "Pause plot";
     dom.pauseButton.classList.toggle("is-active", state.paused);
@@ -1062,10 +1503,17 @@
     state.specs = new Map(state.catalog.map((spec) => [spec.path, spec]));
     state.views = catalog.views;
     state.serviceUnits = catalog.service_units;
+    state.historyAvailable = Boolean(catalog.history_available);
     state.highZFloorOhm =
       Number(catalog.resistance_high_z_floor_ohm) || 500;
+    const historyOption = dom.modeSelect.querySelector('option[value="history"]');
+    if (historyOption) {
+      historyOption.textContent = state.historyAvailable
+        ? "History"
+        : "History unavailable";
+    }
     buildVariableTable();
-    buildChartTabs();
+    buildChartPanels();
     renderChartHeading();
   }
 
@@ -1096,9 +1544,24 @@
   }
 
   function bindEvents() {
+    document
+      .querySelector('.section-nav a[href="#variables"]')
+      ?.addEventListener("click", () => {
+        dom.variableDetails.open = true;
+      });
+    dom.modeSelect.addEventListener("change", () => {
+      setPlotMode(dom.modeSelect.value);
+    });
     dom.rangeSelect.addEventListener("change", () => {
-      state.windowSeconds = Number(dom.rangeSelect.value);
-      scheduleDraw();
+      updateRangeOptions();
+      if (state.plotMode === "history") loadHistory();
+      else scheduleDraw();
+    });
+    dom.historyFrom.addEventListener("change", () => {
+      if (state.plotMode === "history") loadHistory();
+    });
+    dom.historyTo.addEventListener("change", () => {
+      if (state.plotMode === "history") loadHistory();
     });
     dom.pauseButton.addEventListener("click", togglePause);
     dom.exportButton.addEventListener("click", exportCsv);
@@ -1108,12 +1571,12 @@
       dom.eventList.replaceChildren();
       addEvent("Session log cleared.");
     });
-    dom.canvas.addEventListener("mousemove", showTooltip);
-    dom.canvas.addEventListener("mouseleave", hideTooltip);
     window.addEventListener("resize", scheduleDraw);
   }
 
   async function start() {
+    initializeHistoryInputs();
+    updateRangeOptions();
     bindEvents();
     updateClock();
     setInterval(updateClock, 1000);

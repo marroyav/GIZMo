@@ -587,7 +587,9 @@ class GizmoOpcUaServer:
             "Active",
             False,
             ua.VariantType.Boolean,
-            "True when the current measurement satisfies an alarm condition.",
+            "Authoritative composite alarm decision reported by the ZMon "
+            "measurement engine at the relay/beacon control branch; not "
+            "recomputed by OPC UA.",
         )
         self._add_point(
             alarm,
@@ -595,7 +597,8 @@ class GizmoOpcUaServer:
             "Reason",
             "",
             ua.VariantType.String,
-            "ResistanceThreshold, PhaseInterpolation, HistoricalLatch, or empty.",
+            "Alarm reason reported directly by the ZMon measurement engine, "
+            "or empty when the composite alarm is clear.",
         )
         self._add_point(
             alarm,
@@ -2070,11 +2073,8 @@ class GizmoOpcUaServer:
             snapshot.quality,
             stamp,
         )
-        alarm_active = bool(snapshot.alarm_reason) and (
-            snapshot.alarm_reason != "HistoricalLatch"
-        )
         self._update("Alarm.Latched", snapshot.alarm_latched, snapshot.quality, stamp)
-        self._update("Alarm.Active", alarm_active, snapshot.quality, stamp)
+        self._update("Alarm.Active", snapshot.alarm_active, snapshot.quality, stamp)
         self._update("Alarm.Reason", snapshot.alarm_reason, snapshot.quality, stamp)
         self._update(
             "Alarm.LatchTime",

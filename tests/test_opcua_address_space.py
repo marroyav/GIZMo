@@ -34,7 +34,8 @@ class AddressSpaceTests(unittest.TestCase):
         record = (
             "Data from C-server: Res=192.1,Cap=4,Th=100,Mag=91,"
             "Phase=-0.230,Phase2=179.770,PhaseRX=179.700,"
-            "I=-20,Q=1,latched=1,LatchStamp=2026-07-27 10:11:12"
+            "I=-20,Q=1,Alarm=1,AlarmReason=PhaseInterpolation,"
+            "latched=1,LatchStamp=2026-07-27 10:11:12"
         )
         snapshot = parse_legacy_measurement(
             record,
@@ -67,6 +68,17 @@ class AddressSpaceTests(unittest.TestCase):
         self.assertTrue(value.StatusCode.is_good())
         self.assertIsNotNone(value.SourceTimestamp)
 
+    def test_alarm_is_the_measurement_engine_boolean(self) -> None:
+        active = self.node("Alarm.Active")
+        reason = self.node("Alarm.Reason")
+
+        self.assertTrue(active.get_value())
+        self.assertEqual(reason.get_value(), "PhaseInterpolation")
+        self.assertIn(
+            "not recomputed",
+            active.get_description().Text,
+        )
+
     def test_measurement_exposes_standard_engineering_units_property(self) -> None:
         resistance = self.node("Measurement.ResistanceOhm")
         unit = resistance.get_child(["0:EngineeringUnits"]).get_value()
@@ -80,7 +92,7 @@ class AddressSpaceTests(unittest.TestCase):
         )
         self.assertEqual(
             self.node("Identity.ModelVersion").get_value(),
-            "1.1.1",
+            "1.3.0",
         )
 
     def test_legacy_command_object_is_preserved(self) -> None:
