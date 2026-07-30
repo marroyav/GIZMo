@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly base="${GIZMO_OFFBOARD_BASE:-/srv/gizmo-monitor}"
+readonly component="${1:-}"
+
+case "${component}" in
+    historian|dashboard) ;;
+    *)
+        printf 'Usage: %s {historian|dashboard}\n' "$0" >&2
+        exit 2
+        ;;
+esac
+
+set -a
+# shellcheck disable=SC1091
+. "${base}/config/runtime.env"
+set +a
+
+exec >>"${base}/logs/${component}.log" 2>&1
+
+while true
+do
+    printf '%s starting %s\n' "$(date --iso-8601=seconds)" "${component}"
+    set +e
+    "${base}/venv/bin/python" \
+        "${base}/app/src/python/gizmo_${component}.py"
+    status=$?
+    set -e
+    printf '%s %s exited with status %s; retrying in 5 seconds\n' \
+        "$(date --iso-8601=seconds)" "${component}" "${status}"
+    sleep 5
+done

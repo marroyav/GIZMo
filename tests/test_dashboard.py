@@ -207,6 +207,10 @@ class DashboardHttpTests(unittest.TestCase):
         self.assertFalse(health["historian_available"])
 
     def test_unavailable_historian_is_a_bounded_degraded_route(self) -> None:
+        self.assertEqual(
+            dashboard.HISTORY_ROUTES["/api/history/replication"],
+            "/replication",
+        )
         with self.assertRaises(urllib.error.HTTPError) as raised:
             urllib.request.urlopen(
                 self.base + "/api/history/status",

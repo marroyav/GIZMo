@@ -61,6 +61,8 @@ install: all
 	install -m 0644 config/default-state/* $(DESTDIR)$(PREFIX)/share/gizmo/default-state/
 	install -d -m 0755 $(DESTDIR)/lib/systemd/system
 	install -m 0644 packaging/systemd/* $(DESTDIR)/lib/systemd/system/
+	install -D -m 0644 config/60-gizmo-timesyncd.conf \
+		$(DESTDIR)$(PREFIX)/lib/systemd/timesyncd.conf.d/60-gizmo.conf
 	install -D -m 0644 packaging/sysusers/gizmo.conf $(DESTDIR)$(PREFIX)/lib/sysusers.d/gizmo.conf
 	install -D -m 0644 packaging/tmpfiles/gizmo.conf $(DESTDIR)$(PREFIX)/lib/tmpfiles.d/gizmo.conf
 	install -D -m 0644 packaging/udev/99-gizmo.rules $(DESTDIR)$(PREFIX)/lib/udev/rules.d/99-gizmo.rules

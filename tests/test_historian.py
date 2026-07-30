@@ -9,9 +9,12 @@ import sqlite3
 import sys
 import tempfile
 import threading
+import time
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import parse_qs, urlsplit
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src" / "python"))
@@ -248,6 +251,184 @@ class HistorianTests(unittest.TestCase):
         self.assertEqual(removed["platform_sample"], 1)
         self.assertEqual(self.store.storage_status()["fast_samples"]["count"], 0)
 
+    def test_cursor_replication_is_raw_atomic_and_idempotent(self) -> None:
+        first = fake_snapshot(1)
+        second = fake_snapshot(2, high_z=True)
+        accumulator = None
+        for snapshot in (first, second):
+            receive_time_us, _ = self.store.record_fast(snapshot, self.stream)
+            if accumulator is None:
+                bucket = receive_time_us // 60_000_000 * 60_000_000
+                accumulator = historian.MinuteAccumulator(bucket)
+            accumulator.update(snapshot)
+        assert accumulator is not None
+        self.store.record_platform(second)
+        self.store.write_rollup(accumulator)
+        self.store.record_event(
+            "Alarm.Active",
+            "replication test event",
+            severity="alarm",
+            details={"active": True},
+            time_us=historian.parse_time_us(stamp(2)),
+        )
+
+        replica = historian.HistorianStore(
+            Path(self.temporary.name) / "replica.sqlite3",
+            min_free_bytes=1,
+        )
+        replica.initialize()
+        try:
+            fast_first = self.store.replication_batch(
+                "fast_sample",
+                0,
+                0,
+                limit=1,
+            )
+            self.assertTrue(fast_first["has_more"])
+            source_id = fast_first["source"]["id"]
+            imported_first = replica.import_replication_batch(
+                fast_first,
+                expected_source_id=source_id,
+            )
+            fast_cursor = imported_first["cursor"]
+            fast_second = self.store.replication_batch(
+                "fast_sample",
+                fast_cursor["key"],
+                fast_cursor["tie"],
+                limit=10,
+            )
+            self.assertFalse(fast_second["has_more"])
+            replica.import_replication_batch(
+                fast_second,
+                expected_source_id=source_id,
+            )
+
+            # Replaying an acknowledged batch must neither duplicate nor fail.
+            replay = replica.import_replication_batch(
+                fast_first,
+                expected_source_id=source_id,
+            )
+            self.assertEqual(replay["imported"], 0)
+            self.assertEqual(replay["skipped"], 1)
+
+            for table in (
+                "platform_sample",
+                "minute_rollup",
+                "event",
+            ):
+                batch = self.store.replication_batch(table, 0, 0, limit=10)
+                replica.import_replication_batch(
+                    batch,
+                    expected_source_id=source_id,
+                )
+
+            status = replica.storage_status()
+            self.assertEqual(status["fast_samples"]["count"], 2)
+            self.assertEqual(status["platform_samples"]["count"], 1)
+            self.assertEqual(status["minute_rollups"]["count"], 1)
+            self.assertEqual(status["events"]["count"], 1)
+            self.assertEqual(
+                {
+                    row["table"]
+                    for row in status["replication"]
+                },
+                set(historian.REPLICATION_TABLES),
+            )
+            start = historian.parse_time_us(stamp(0))
+            end = historian.parse_time_us(stamp(3))
+            assert start is not None and end is not None
+            query = replica.query(
+                ("Measurement.ResistanceOhm", "Alarm.Active"),
+                start,
+                end,
+                max_points=10,
+            )
+            self.assertEqual(query["point_count"], 2)
+            self.assertEqual(query["points"][1]["resistanceRange"], "OutOfRange")
+
+            with self.assertRaisesRegex(ValueError, "configured identity"):
+                replica.import_replication_batch(
+                    fast_second,
+                    expected_source_id="unexpected-board",
+                )
+        finally:
+            replica.close()
+
+    def test_replica_recorder_catches_up_over_bounded_http_batches(self) -> None:
+        self.store.record_fast(fake_snapshot(1), self.stream)
+
+        source_store = self.store
+
+        class ReplicationHandler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                split = urlsplit(self.path)
+                query = parse_qs(split.query)
+                if split.path != "/replication":
+                    self.send_error(404)
+                    return
+                body = json.dumps(
+                    source_store.replication_batch(
+                        query["table"][0],
+                        int(query.get("after", ["0"])[0]),
+                        int(query.get("after_tie", ["0"])[0]),
+                        limit=int(query.get("limit", ["1000"])[0]),
+                    ),
+                    separators=(",", ":"),
+                ).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, fmt: str, *args: object) -> None:
+                del fmt, args
+
+        http_server = ThreadingHTTPServer(
+            ("127.0.0.1", 0),
+            ReplicationHandler,
+        )
+        http_thread = threading.Thread(
+            target=http_server.serve_forever,
+            daemon=True,
+        )
+        http_thread.start()
+        replica = historian.HistorianStore(
+            Path(self.temporary.name) / "network-replica.sqlite3",
+            min_free_bytes=1,
+        )
+        replica.initialize()
+        recorder = historian.ReplicaRecorder(
+            replica,
+            f"http://127.0.0.1:{http_server.server_port}/replication",
+            poll_seconds=0.05,
+            batch_size=1,
+        )
+        recorder.start()
+        try:
+            deadline = time.monotonic() + 3
+            while (
+                replica.storage_status()["fast_samples"]["count"] < 1
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.02)
+            status = recorder.status()
+            self.assertEqual(
+                replica.storage_status()["fast_samples"]["count"],
+                1,
+            )
+            self.assertTrue(status["replica_connected"])
+            self.assertEqual(status["source_hostname"], socket.gethostname())
+            self.assertIsNotNone(status["last_sample_at"])
+            self.assertEqual(status["dropped_samples"], 0)
+            self.assertIn("sync_errors", status)
+        finally:
+            recorder.stop()
+            http_server.shutdown()
+            http_server.server_close()
+            http_thread.join(timeout=2)
+            replica.close()
+
     def test_unix_http_status_and_read_only_boundary(self) -> None:
         socket_path = Path(self.temporary.name) / "historian.sock"
         recorder = SimpleNamespace(
@@ -266,6 +447,11 @@ class HistorianTests(unittest.TestCase):
         thread.start()
         try:
             status, body = self._unix_request(socket_path, "GET", "/status")
+            replication_status, replication_body = self._unix_request(
+                socket_path,
+                "GET",
+                "/replication?table=fast_sample&after=0&limit=10",
+            )
             post_status, post_body = self._unix_request(
                 socket_path,
                 "POST",
@@ -278,6 +464,11 @@ class HistorianTests(unittest.TestCase):
 
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body)["status"], "ok")
+        self.assertEqual(replication_status, 200)
+        self.assertEqual(
+            json.loads(replication_body)["table"],
+            "fast_sample",
+        )
         self.assertEqual(post_status, 405)
         self.assertEqual(
             json.loads(post_body),

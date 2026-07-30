@@ -16,9 +16,17 @@ cleanup()
 }
 trap cleanup EXIT HUP INT TERM
 
-for script in "$repo_root"/scripts/* "$repo_root"/packaging/*.sh "$repo_root"/packaging/maintainer-scripts/*; do
+for script in \
+    "$repo_root"/scripts/* \
+    "$repo_root"/packaging/*.sh \
+    "$repo_root"/packaging/maintainer-scripts/* \
+    "$repo_root"/deploy/offboard/run-component \
+    "$repo_root"/deploy/offboard/start \
+    "$repo_root"/deploy/offboard/status
+do
     case "$(sed -n '1p' "$script")" in
         *python*) ;;
+        *bash*) bash -n "$script" ;;
         *) sh -n "$script" ;;
     esac
 done
@@ -160,6 +168,19 @@ if ! grep -q 'gizmo-historian\.service' \
     exit 1
 fi
 echo "ok   historian lifecycle and storage ownership"
+
+if ! grep -q '^NTP=192\.168\.191\.90$' \
+        "$repo_root/config/60-gizmo-timesyncd.conf" ||
+    ! grep -q '^FallbackNTP=ntp\.fnal\.gov ' \
+        "$repo_root/config/60-gizmo-timesyncd.conf" ||
+    ! grep -q 'timesyncd\.conf\.d/60-gizmo\.conf' \
+        "$repo_root/Makefile" ||
+    ! grep -q 'enable --now systemd-timesyncd\.service' \
+        "$repo_root/packaging/maintainer-scripts/postinst"; then
+    echo "Persistent Kria time synchronization is not package-owned" >&2
+    exit 1
+fi
+echo "ok   persistent Fermilab time synchronization"
 
 if grep -q '^Requires=' "$repo_root/packaging/systemd/gizmo.target" ||
     grep -q '^Requires=.*gizmo-zmon' \
