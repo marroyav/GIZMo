@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -u
+
+readonly base="${GIZMO_OFFBOARD_BASE:-/storage/gizmo-monitor}"
+readonly session="${GIZMO_OFFBOARD_TMUX_SESSION:-gizmo-monitor}"
+
+printf 'Processes\n'
+/usr/bin/tmux list-windows -t "${session}" \
+    -F '#{window_index} #{window_name} active=#{window_active} dead=#{pane_dead} pid=#{pane_pid}' \
+    2>&1
+
+printf '\nHistorian\n'
+/usr/bin/curl --silent --show-error --max-time 5 \
+    --unix-socket "${base}/run/historian.sock" \
+    http://localhost/status
+printf '\n\nDashboard\n'
+/usr/bin/curl --silent --show-error --max-time 5 \
+    http://127.0.0.1:18081/healthz
+printf '\n\nStorage\n'
+/usr/bin/du -h "${base}/data/gizmo-history.sqlite3" 2>/dev/null || true
+/usr/bin/df -h "${base}/data" | tail -n 1

@@ -10,11 +10,12 @@ persistent historian, and web-dashboard components. Systemd owns startup
 ordering, privileges, restarts, logs, and shutdown. Operators still start and
 stop the product as one unit.
 
-> Status: runtime 0.4.3 is the maintained package. It adds the ZMon
-> measurement engine's authoritative composite relay/beacon alarm to OPC UA,
-> the historian, and the full-width dark operations dashboard without
-> reimplementing the resistance/phase decision in monitoring code. Runtime
-> 0.4.0 was installed and historian-restart tested, and
+> Status: runtime 0.4.4 is the maintained package. It keeps the Kria historian
+> as a 14-day edge buffer, adds cursor-based recovery to independent off-board
+> replicas, and package-owns boot-time synchronization through Fermilab's NTP
+> pool. Runtime 0.4.3 added the ZMon measurement engine's authoritative
+> composite relay/beacon alarm to OPC UA, the historian, and the full-width
+> operations dashboard. Runtime 0.4.0 was historian-restart tested, and
 > runtime 0.2.9 was cold-boot tested, on the borrowed instrument.
 > Installation itself does not enable or start `gizmo.target`.
 
@@ -87,12 +88,22 @@ See [the OPC UA contract](docs/opcua.md). The recovered
 `SimpleOPCUAServer/CommandObject` namespace and text ZeroMQ API remain as
 compatibility interfaces during migration.
 
+The first independent off-board history replica and dashboard run on
+`dune-fd-test01`; see the
+[off-board monitoring guide](docs/offboard-monitoring.md). The reusable
+user-mode replica files are in `deploy/offboard/`. The replica mirrors the
+Kria edge historian and catches up automatically after a network or server
+outage.
+
 The board also serves a read-only console at
 `http://<gizmo-address>:8080/`. It uses one shared live OPC UA subscription,
 preserves value status codes, plots up to one hour in the browser, and queries
 package-owned persistent history for longer intervals and CSV export. See
 [the dashboard guide](docs/dashboard.md) and
 [historian design](docs/historian.md).
+
+The Kria clock is synchronized at boot with `systemd-timesyncd`; see the
+[time-synchronization guide](docs/time-synchronization.md).
 
 Local historian inspection is intentionally restricted to privileged
 operators:
@@ -112,7 +123,7 @@ Read [the migration procedure](docs/migration.md) before touching a running
 legacy image. The safe high-level sequence is:
 
 ```sh
-sudo dpkg -i build/gizmo-runtime_0.4.3_arm64.deb
+sudo dpkg -i build/gizmo-runtime_0.4.4_arm64.deb
 sudo gizmo-doctor
 ```
 

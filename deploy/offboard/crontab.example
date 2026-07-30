@@ -1,0 +1,2 @@
+@reboot /storage/gizmo-monitor/bin/start >/dev/null 2>&1
+*/5 * * * * /storage/gizmo-monitor/bin/start >/dev/null 2>&1

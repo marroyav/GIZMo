@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly base="${GIZMO_OFFBOARD_BASE:-/storage/gizmo-monitor}"
+readonly session="${GIZMO_OFFBOARD_TMUX_SESSION:-gizmo-monitor}"
+
+if /usr/bin/tmux has-session -t "${session}" 2>/dev/null; then
+    exit 0
+fi
+
+install -d -m 0750 "${base}/run" "${base}/logs" "${base}/data"
+
+/usr/bin/tmux new-session -d \
+    -s "${session}" \
+    -n historian \
+    "${base}/bin/run-component historian"
+/usr/bin/tmux set-option -t "${session}" remain-on-exit on
+/usr/bin/tmux new-window \
+    -t "${session}" \
+    -n dashboard \
+    "${base}/bin/run-component dashboard"

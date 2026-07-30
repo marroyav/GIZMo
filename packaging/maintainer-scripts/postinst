@@ -21,6 +21,7 @@ fi
 
 if [ -d /run/systemd/system ]; then
     systemctl daemon-reload
+    systemctl enable --now systemd-timesyncd.service >/dev/null 2>&1 || true
     if [ -e /run/gizmo/restart-after-upgrade ]; then
         rm -f /run/gizmo/restart-after-upgrade
         systemctl start gizmo.target

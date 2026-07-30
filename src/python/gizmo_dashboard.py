@@ -650,6 +650,7 @@ HISTORY_ROUTES = {
     "/api/history/query": "/query",
     "/api/history/events": "/events",
     "/api/history/export.csv": "/export.csv",
+    "/api/history/replication": "/replication",
 }
 
 
@@ -792,7 +793,11 @@ class OpcUaMonitor:
             ua.AttributeIds.NodeClass,
         )
         nodes = []
-        for node, result in zip(candidate_nodes, existence_results, strict=True):
+        if len(candidate_nodes) != len(existence_results):
+            raise RuntimeError(
+                "OPC UA existence result count does not match the requested nodes"
+            )
+        for node, result in zip(candidate_nodes, existence_results):
             path = node_paths[node.nodeid.to_string()]
             if result.StatusCode.is_good():
                 nodes.append(node)
@@ -841,7 +846,11 @@ class OpcUaMonitor:
         )
         received_at = utc_now()
         with self._lock:
-            for node, result in zip(nodes, results, strict=True):
+            if len(nodes) != len(results):
+                raise RuntimeError(
+                    "OPC UA read result count does not match the requested nodes"
+                )
+            for node, result in zip(nodes, results):
                 path = self._node_paths[node.nodeid.to_string()]
                 value = json_value(result.Value.Value)
                 status = status_name(result.StatusCode)

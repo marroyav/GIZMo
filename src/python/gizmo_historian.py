@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import base64
 import csv
 import datetime as dt
 import io
@@ -15,12 +16,14 @@ import socketserver
 import sqlite3
 import threading
 import time
+import urllib.error
+import urllib.request
 import zlib
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any, Iterable
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 from gizmo_dashboard import (
     CATALOG,
@@ -30,7 +33,7 @@ from gizmo_dashboard import (
 )
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DEFAULT_ENDPOINT = "opc.tcp://127.0.0.1:4840"
 DEFAULT_DATABASE = "/var/lib/gizmo/history/gizmo-history.sqlite3"
 DEFAULT_SOCKET = "/run/gizmo/historian.sock"
@@ -43,6 +46,16 @@ DEFAULT_EVENT_RETENTION_DAYS = 1825
 DEFAULT_MAX_QUERY_POINTS = 5000
 DEFAULT_MAX_EXPORT_ROWS = 100_000
 DEFAULT_MIN_FREE_BYTES = 2 * 1024**3
+DEFAULT_REPLICA_POLL_SECONDS = 2.0
+DEFAULT_REPLICA_BATCH_SIZE = 1000
+MAX_REPLICA_BATCH_SIZE = 2000
+MAX_REPLICA_RESPONSE_BYTES = 8 * 1024**2
+REPLICATION_TABLES = (
+    "fast_sample",
+    "platform_sample",
+    "minute_rollup",
+    "event",
+)
 MONTH_SECONDS = 365.2425 / 12 * 86400
 
 RESISTANCE_RANGE_PATH = "Measurement.ResistanceRange"
@@ -146,6 +159,19 @@ def now_us() -> int:
     return time.time_ns() // 1000
 
 
+def local_source_identity() -> dict[str, str]:
+    machine_id = ""
+    try:
+        machine_id = Path("/etc/machine-id").read_text().strip()
+    except OSError:
+        pass
+    hostname = socket.gethostname()
+    return {
+        "id": machine_id or f"hostname:{hostname}",
+        "hostname": hostname,
+    }
+
+
 def parse_time_us(value: Any) -> int | None:
     if value is None or value == "":
         return None
@@ -222,7 +248,11 @@ def encode_payload(
 def decode_payload(paths: tuple[str, ...], payload: bytes) -> dict[str, dict[str, Any]]:
     entries = json.loads(zlib.decompress(payload))
     result: dict[str, dict[str, Any]] = {}
-    for path, entry in zip(paths, entries, strict=True):
+    if len(paths) != len(entries):
+        raise ValueError(
+            "historian payload entry count does not match the configured paths"
+        )
+    for path, entry in zip(paths, entries):
         value, status, source_time_us = entry
         result[path] = {
             "value": value,
@@ -441,6 +471,33 @@ class HistorianStore:
             );
 
             CREATE INDEX IF NOT EXISTS event_time ON event(time_us);
+
+            CREATE TABLE IF NOT EXISTS replication_source (
+                source_id TEXT PRIMARY KEY,
+                hostname TEXT NOT NULL,
+                schema_version INTEGER NOT NULL,
+                first_seen_us INTEGER NOT NULL,
+                last_seen_us INTEGER NOT NULL
+            ) WITHOUT ROWID;
+
+            CREATE TABLE IF NOT EXISTS replication_cursor (
+                source_id TEXT NOT NULL
+                    REFERENCES replication_source(source_id),
+                table_name TEXT NOT NULL,
+                remote_key INTEGER NOT NULL,
+                remote_tie INTEGER NOT NULL,
+                updated_us INTEGER NOT NULL,
+                PRIMARY KEY(source_id, table_name)
+            ) WITHOUT ROWID;
+
+            CREATE TABLE IF NOT EXISTS replication_stream (
+                source_id TEXT NOT NULL
+                    REFERENCES replication_source(source_id),
+                remote_stream_id INTEGER NOT NULL,
+                local_stream_id INTEGER NOT NULL UNIQUE
+                    REFERENCES stream(id),
+                PRIMARY KEY(source_id, remote_stream_id)
+            ) WITHOUT ROWID;
             """
         )
         existing = connection.execute(
@@ -1050,6 +1107,455 @@ class HistorianStore:
         with self._lock:
             self.writer.execute("PRAGMA wal_checkpoint(PASSIVE)")
 
+    @staticmethod
+    def _replication_position(
+        table: str,
+        row: sqlite3.Row | dict[str, Any],
+    ) -> tuple[int, int]:
+        if table == "minute_rollup":
+            return int(row["updated_us"]), int(row["bucket_us"])
+        key = "id" if table == "event" else "receive_time_us"
+        return int(row[key]), 0
+
+    def replication_batch(
+        self,
+        table: str,
+        after_key: int,
+        after_tie: int,
+        *,
+        limit: int,
+    ) -> dict[str, Any]:
+        if table not in REPLICATION_TABLES:
+            raise ValueError("replication table is not allowed")
+        if after_key < 0 or after_tie < 0:
+            raise ValueError("replication cursor cannot be negative")
+        if not 1 <= limit <= MAX_REPLICA_BATCH_SIZE:
+            raise ValueError("replication batch size is outside the allowed range")
+
+        with self._connect(readonly=True) as connection:
+            if table == "fast_sample":
+                rows = connection.execute(
+                    """
+                    SELECT receive_time_us, stream_id, sequence, payload
+                    FROM fast_sample
+                    WHERE receive_time_us > ?
+                    ORDER BY receive_time_us
+                    LIMIT ?
+                    """,
+                    (after_key, limit + 1),
+                ).fetchall()
+            elif table == "platform_sample":
+                rows = connection.execute(
+                    """
+                    SELECT receive_time_us, payload
+                    FROM platform_sample
+                    WHERE receive_time_us > ?
+                    ORDER BY receive_time_us
+                    LIMIT ?
+                    """,
+                    (after_key, limit + 1),
+                ).fetchall()
+            elif table == "minute_rollup":
+                rows = connection.execute(
+                    """
+                    SELECT bucket_us, sample_count, payload, updated_us
+                    FROM minute_rollup
+                    WHERE updated_us > ?
+                       OR (updated_us = ? AND bucket_us > ?)
+                    ORDER BY updated_us, bucket_us
+                    LIMIT ?
+                    """,
+                    (after_key, after_key, after_tie, limit + 1),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """
+                    SELECT id, time_us, source_time_us, severity, event_key,
+                           summary, details_json
+                    FROM event
+                    WHERE id > ?
+                    ORDER BY id
+                    LIMIT ?
+                    """,
+                    (after_key, limit + 1),
+                ).fetchall()
+
+            has_more = len(rows) > limit
+            rows = rows[:limit]
+            streams: list[dict[str, Any]] = []
+            if table == "fast_sample" and rows:
+                stream_ids = tuple(
+                    sorted({int(row["stream_id"]) for row in rows})
+                )
+                placeholders = ",".join("?" for _ in stream_ids)
+                stream_rows = connection.execute(
+                    f"""
+                    SELECT id, boot_id, started_us, ended_us, first_sequence,
+                           last_sequence, reason
+                    FROM stream
+                    WHERE id IN ({placeholders})
+                    ORDER BY id
+                    """,
+                    stream_ids,
+                ).fetchall()
+                streams = [dict(row) for row in stream_rows]
+
+        encoded_rows = []
+        for row in rows:
+            item = dict(row)
+            if "payload" in item:
+                item["payload"] = base64.b64encode(item["payload"]).decode("ascii")
+            encoded_rows.append(item)
+        cursor_key, cursor_tie = (
+            self._replication_position(table, rows[-1])
+            if rows
+            else (after_key, after_tie)
+        )
+        return {
+            "replication_version": 1,
+            "schema_version": SCHEMA_VERSION,
+            "source": local_source_identity(),
+            "table": table,
+            "after": {"key": after_key, "tie": after_tie},
+            "cursor": {"key": cursor_key, "tie": cursor_tie},
+            "has_more": has_more,
+            "streams": streams,
+            "rows": encoded_rows,
+        }
+
+    def replication_cursor(
+        self,
+        source_id: str,
+        table: str,
+    ) -> tuple[int, int]:
+        with self._connect(readonly=True) as connection:
+            row = connection.execute(
+                """
+                SELECT remote_key, remote_tie
+                FROM replication_cursor
+                WHERE source_id=? AND table_name=?
+                """,
+                (source_id, table),
+            ).fetchone()
+        return (
+            (int(row["remote_key"]), int(row["remote_tie"]))
+            if row is not None
+            else (0, 0)
+        )
+
+    @staticmethod
+    def _decode_replica_payload(value: Any) -> bytes:
+        try:
+            return base64.b64decode(str(value), validate=True)
+        except (ValueError, TypeError) as error:
+            raise ValueError("replication payload is not valid base64") from error
+
+    def import_replication_batch(
+        self,
+        batch: dict[str, Any],
+        *,
+        expected_source_id: str = "",
+    ) -> dict[str, Any]:
+        if int(batch.get("replication_version", 0)) != 1:
+            raise ValueError("unsupported replication protocol version")
+        if int(batch.get("schema_version", 0)) != SCHEMA_VERSION:
+            raise ValueError("replication historian schema does not match")
+        table = str(batch.get("table") or "")
+        if table not in REPLICATION_TABLES:
+            raise ValueError("replication table is not allowed")
+        source = batch.get("source")
+        if not isinstance(source, dict):
+            raise ValueError("replication source identity is missing")
+        source_id = str(source.get("id") or "").strip()
+        hostname = str(source.get("hostname") or "").strip()
+        if not source_id or not hostname:
+            raise ValueError("replication source identity is incomplete")
+        if expected_source_id and source_id != expected_source_id:
+            raise ValueError("replication source does not match configured identity")
+        rows = batch.get("rows")
+        streams = batch.get("streams", [])
+        cursor = batch.get("cursor")
+        if not isinstance(rows, list) or not isinstance(streams, list):
+            raise ValueError("replication batch rows are invalid")
+        if not isinstance(cursor, dict):
+            raise ValueError("replication cursor is missing")
+        cursor_position = (int(cursor.get("key", -1)), int(cursor.get("tie", -1)))
+        if cursor_position[0] < 0 or cursor_position[1] < 0:
+            raise ValueError("replication cursor is invalid")
+
+        imported = 0
+        skipped = 0
+        stamp = now_us()
+        with self._lock:
+            connection = self.writer
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute(
+                    """
+                    INSERT INTO replication_source(
+                        source_id, hostname, schema_version, first_seen_us,
+                        last_seen_us
+                    ) VALUES(?, ?, ?, ?, ?)
+                    ON CONFLICT(source_id) DO UPDATE SET
+                        hostname=excluded.hostname,
+                        schema_version=excluded.schema_version,
+                        last_seen_us=excluded.last_seen_us
+                    """,
+                    (source_id, hostname, SCHEMA_VERSION, stamp, stamp),
+                )
+                current_row = connection.execute(
+                    """
+                    SELECT remote_key, remote_tie
+                    FROM replication_cursor
+                    WHERE source_id=? AND table_name=?
+                    """,
+                    (source_id, table),
+                ).fetchone()
+                current = (
+                    (
+                        int(current_row["remote_key"]),
+                        int(current_row["remote_tie"]),
+                    )
+                    if current_row is not None
+                    else (0, 0)
+                )
+
+                stream_map: dict[int, int] = {}
+                if table == "fast_sample":
+                    for stream in streams:
+                        remote_id = int(stream["id"])
+                        mapped = connection.execute(
+                            """
+                            SELECT local_stream_id
+                            FROM replication_stream
+                            WHERE source_id=? AND remote_stream_id=?
+                            """,
+                            (source_id, remote_id),
+                        ).fetchone()
+                        if mapped is None:
+                            inserted = connection.execute(
+                                """
+                                INSERT INTO stream(
+                                    boot_id, started_us, ended_us,
+                                    first_sequence, last_sequence, reason
+                                ) VALUES(?, ?, ?, ?, ?, ?)
+                                """,
+                                (
+                                    str(stream["boot_id"]),
+                                    int(stream["started_us"]),
+                                    (
+                                        int(stream["ended_us"])
+                                        if stream.get("ended_us") is not None
+                                        else None
+                                    ),
+                                    stream.get("first_sequence"),
+                                    stream.get("last_sequence"),
+                                    f"replica:{stream['reason']}",
+                                ),
+                            )
+                            local_id = int(inserted.lastrowid)
+                            connection.execute(
+                                """
+                                INSERT INTO replication_stream(
+                                    source_id, remote_stream_id, local_stream_id
+                                ) VALUES(?, ?, ?)
+                                """,
+                                (source_id, remote_id, local_id),
+                            )
+                        else:
+                            local_id = int(mapped["local_stream_id"])
+                            connection.execute(
+                                """
+                                UPDATE stream SET
+                                    boot_id=?, started_us=?, ended_us=?,
+                                    first_sequence=?, last_sequence=?,
+                                    reason=?
+                                WHERE id=?
+                                """,
+                                (
+                                    str(stream["boot_id"]),
+                                    int(stream["started_us"]),
+                                    (
+                                        int(stream["ended_us"])
+                                        if stream.get("ended_us") is not None
+                                        else None
+                                    ),
+                                    stream.get("first_sequence"),
+                                    stream.get("last_sequence"),
+                                    f"replica:{stream['reason']}",
+                                    local_id,
+                                ),
+                            )
+                        stream_map[remote_id] = local_id
+
+                last_position = current
+                previous_position = (-1, -1)
+                for item in rows:
+                    if not isinstance(item, dict):
+                        raise ValueError("replication row is invalid")
+                    position = self._replication_position(table, item)
+                    if position <= previous_position:
+                        raise ValueError("replication rows are not strictly ordered")
+                    previous_position = position
+                    if position <= current:
+                        skipped += 1
+                        continue
+                    last_position = position
+
+                    if table == "fast_sample":
+                        payload = self._decode_replica_payload(item.get("payload"))
+                        decode_payload(FAST_CAPTURE_PATHS, payload)
+                        remote_stream_id = int(item["stream_id"])
+                        local_stream_id = stream_map.get(remote_stream_id)
+                        if local_stream_id is None:
+                            mapped = connection.execute(
+                                """
+                                SELECT local_stream_id
+                                FROM replication_stream
+                                WHERE source_id=? AND remote_stream_id=?
+                                """,
+                                (source_id, remote_stream_id),
+                            ).fetchone()
+                            if mapped is None:
+                                raise ValueError(
+                                    "replication batch references an unknown stream"
+                                )
+                            local_stream_id = int(mapped["local_stream_id"])
+                        existing = connection.execute(
+                            """
+                            SELECT sequence, payload FROM fast_sample
+                            WHERE receive_time_us=?
+                            """,
+                            (position[0],),
+                        ).fetchone()
+                        sequence = item.get("sequence")
+                        if existing is None:
+                            connection.execute(
+                                """
+                                INSERT INTO fast_sample(
+                                    receive_time_us, stream_id, sequence, payload
+                                ) VALUES(?, ?, ?, ?)
+                                """,
+                                (position[0], local_stream_id, sequence, payload),
+                            )
+                            imported += 1
+                        elif (
+                            existing["sequence"] == sequence
+                            and existing["payload"] == payload
+                        ):
+                            skipped += 1
+                        else:
+                            raise ValueError(
+                                "replication fast-sample timestamp collision"
+                            )
+                    elif table == "platform_sample":
+                        payload = self._decode_replica_payload(item.get("payload"))
+                        decode_payload(PLATFORM_CAPTURE_PATHS, payload)
+                        existing = connection.execute(
+                            """
+                            SELECT payload FROM platform_sample
+                            WHERE receive_time_us=?
+                            """,
+                            (position[0],),
+                        ).fetchone()
+                        if existing is None:
+                            connection.execute(
+                                """
+                                INSERT INTO platform_sample(receive_time_us, payload)
+                                VALUES(?, ?)
+                                """,
+                                (position[0], payload),
+                            )
+                            imported += 1
+                        elif existing["payload"] == payload:
+                            skipped += 1
+                        else:
+                            raise ValueError(
+                                "replication platform-sample timestamp collision"
+                            )
+                    elif table == "minute_rollup":
+                        payload = self._decode_replica_payload(item.get("payload"))
+                        bucket_us = int(item["bucket_us"])
+                        MinuteAccumulator.decode(bucket_us, payload)
+                        connection.execute(
+                            """
+                            INSERT INTO minute_rollup(
+                                bucket_us, sample_count, payload, updated_us
+                            ) VALUES(?, ?, ?, ?)
+                            ON CONFLICT(bucket_us) DO UPDATE SET
+                                sample_count=excluded.sample_count,
+                                payload=excluded.payload,
+                                updated_us=excluded.updated_us
+                            """,
+                            (
+                                bucket_us,
+                                int(item["sample_count"]),
+                                payload,
+                                int(item["updated_us"]),
+                            ),
+                        )
+                        imported += 1
+                    else:
+                        details_text = str(item["details_json"])
+                        details = json.loads(details_text)
+                        if not isinstance(details, dict):
+                            raise ValueError("replication event details are invalid")
+                        connection.execute(
+                            """
+                            INSERT INTO event(
+                                time_us, source_time_us, severity, event_key,
+                                summary, details_json
+                            ) VALUES(?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                int(item["time_us"]),
+                                (
+                                    int(item["source_time_us"])
+                                    if item.get("source_time_us") is not None
+                                    else None
+                                ),
+                                str(item["severity"]),
+                                str(item["event_key"]),
+                                str(item["summary"]),
+                                details_text,
+                            ),
+                        )
+                        imported += 1
+
+                if rows and cursor_position != previous_position:
+                    raise ValueError("replication cursor does not match final row")
+                new_cursor = max(current, cursor_position)
+                connection.execute(
+                    """
+                    INSERT INTO replication_cursor(
+                        source_id, table_name, remote_key, remote_tie, updated_us
+                    ) VALUES(?, ?, ?, ?, ?)
+                    ON CONFLICT(source_id, table_name) DO UPDATE SET
+                        remote_key=excluded.remote_key,
+                        remote_tie=excluded.remote_tie,
+                        updated_us=excluded.updated_us
+                    """,
+                    (
+                        source_id,
+                        table,
+                        new_cursor[0],
+                        new_cursor[1],
+                        stamp,
+                    ),
+                )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return {
+            "source_id": source_id,
+            "hostname": hostname,
+            "table": table,
+            "imported": imported,
+            "skipped": skipped,
+            "cursor": {"key": new_cursor[0], "tie": new_cursor[1]},
+        }
+
     def storage_status(self) -> dict[str, Any]:
         with self._connect(readonly=True) as connection:
             fast = connection.execute(
@@ -1074,6 +1580,16 @@ class HistorianStore:
             event_count = connection.execute(
                 "SELECT COUNT(*) FROM event"
             ).fetchone()[0]
+            replicas = connection.execute(
+                """
+                SELECT s.source_id, s.hostname, s.last_seen_us, c.table_name,
+                       c.remote_key, c.remote_tie, c.updated_us
+                FROM replication_source AS s
+                LEFT JOIN replication_cursor AS c
+                  ON c.source_id = s.source_id
+                ORDER BY s.source_id, c.table_name
+                """
+            ).fetchall()
             page_size = connection.execute("PRAGMA page_size").fetchone()[0]
             page_count = connection.execute("PRAGMA page_count").fetchone()[0]
             freelist = connection.execute("PRAGMA freelist_count").fetchone()[0]
@@ -1107,6 +1623,18 @@ class HistorianStore:
                 "average_payload_bytes": rollup["average"],
             },
             "events": {"count": event_count},
+            "replication": [
+                {
+                    "source_id": row["source_id"],
+                    "hostname": row["hostname"],
+                    "last_seen": iso_from_us(row["last_seen_us"]),
+                    "table": row["table_name"],
+                    "remote_key": row["remote_key"],
+                    "remote_tie": row["remote_tie"],
+                    "updated": iso_from_us(row["updated_us"]),
+                }
+                for row in replicas
+            ],
             "retention_days": {
                 "raw": self.raw_retention_days,
                 "platform": self.platform_retention_days,
@@ -1381,6 +1909,239 @@ class HistorianRecorder:
                     self._dropped_samples += 1
 
 
+class ReplicaRecorder:
+    """Incrementally mirror an edge historian through its read-only API."""
+
+    def __init__(
+        self,
+        store: HistorianStore,
+        replica_url: str,
+        *,
+        poll_seconds: float,
+        batch_size: int,
+        expected_source_id: str = "",
+    ) -> None:
+        self.store = store
+        self.replica_url = replica_url
+        self.poll_seconds = poll_seconds
+        self.batch_size = batch_size
+        self.expected_source_id = expected_source_id.strip()
+        self._source_id = self.expected_source_id
+        self._source_hostname = ""
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._lock = threading.RLock()
+        self._connected = False
+        self._last_error = ""
+        self._last_sample_at: str | None = None
+        self._last_platform_at: str | None = None
+        self._sync_errors = 0
+        self._rows_imported = 0
+        self._disk_free_bytes = 0
+        self._write_limited = False
+        self._last_retention_monotonic = 0.0
+        self._last_checkpoint_monotonic = 0.0
+        self._last_connection_state: bool | None = None
+        with self.store._connect(readonly=True) as connection:
+            sources = connection.execute(
+                """
+                SELECT source_id, hostname
+                FROM replication_source
+                ORDER BY first_seen_us
+                """
+            ).fetchall()
+        if not self._source_id and len(sources) == 1:
+            self._source_id = str(sources[0]["source_id"])
+            self._source_hostname = str(sources[0]["hostname"])
+        elif self._source_id:
+            match = next(
+                (
+                    row
+                    for row in sources
+                    if str(row["source_id"]) == self._source_id
+                ),
+                None,
+            )
+            if match is not None:
+                self._source_hostname = str(match["hostname"])
+
+    def start(self) -> None:
+        self._thread = threading.Thread(
+            target=self._run,
+            name="gizmo-historian-replica",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=15)
+
+    def status(self) -> dict[str, Any]:
+        with self._lock:
+            lag_seconds = None
+            sample_us = parse_time_us(self._last_sample_at)
+            if sample_us is not None:
+                lag_seconds = max(0.0, (now_us() - sample_us) / 1_000_000)
+            return {
+                # Compatibility with the existing status/dashboard contract:
+                # this means the upstream edge historian is connected.
+                "opcua_connected": self._connected,
+                "replica_connected": self._connected,
+                "mode": "replica",
+                "source_id": self._source_id,
+                "source_hostname": self._source_hostname,
+                "last_sample_at": self._last_sample_at,
+                "last_platform_at": self._last_platform_at,
+                "lag_seconds": lag_seconds,
+                "dropped_samples": 0,
+                "sync_errors": self._sync_errors,
+                "rows_imported": self._rows_imported,
+                "last_error": self._last_error,
+                "stream_id": None,
+                "disk_free_bytes": self._disk_free_bytes,
+                "write_limited": self._write_limited,
+            }
+
+    def _set_connection(self, connected: bool, error: str = "") -> None:
+        with self._lock:
+            previous = self._last_connection_state
+            self._last_connection_state = connected
+            self._connected = connected
+            self._last_error = error
+        if previous is connected:
+            return
+        try:
+            self.store.record_event(
+                "replication.connection",
+                (
+                    "Edge historian replication restored"
+                    if connected
+                    else "Edge historian replication unavailable"
+                ),
+                severity="info" if connected else "warning",
+                details={
+                    "connected": connected,
+                    "url": self.replica_url,
+                    "error": error,
+                },
+            )
+        except (sqlite3.Error, ValueError):
+            pass
+
+    def _check_disk(self) -> bool:
+        stat = os.statvfs(self.store.database.parent)
+        free_bytes = stat.f_bavail * stat.f_frsize
+        total_bytes = stat.f_blocks * stat.f_frsize
+        boundary = max(self.store.min_free_bytes, int(total_bytes * 0.15))
+        limited = free_bytes < boundary
+        with self._lock:
+            self._disk_free_bytes = free_bytes
+            self._write_limited = limited
+        return not limited
+
+    def _cursor(self, table: str) -> tuple[int, int]:
+        if not self._source_id:
+            return 0, 0
+        return self.store.replication_cursor(self._source_id, table)
+
+    def _fetch(
+        self,
+        table: str,
+        cursor: tuple[int, int],
+    ) -> dict[str, Any]:
+        query = urlencode(
+            {
+                "table": table,
+                "after": cursor[0],
+                "after_tie": cursor[1],
+                "limit": self.batch_size,
+            }
+        )
+        separator = "&" if "?" in self.replica_url else "?"
+        request = urllib.request.Request(
+            f"{self.replica_url}{separator}{query}",
+            headers={
+                "Accept": "application/json",
+                "User-Agent": "GIZMoHistorianReplica/1.0",
+            },
+        )
+        with urllib.request.urlopen(request, timeout=15) as response:
+            length = response.getheader("Content-Length")
+            if length is not None and int(length) > MAX_REPLICA_RESPONSE_BYTES:
+                raise ValueError("replication response exceeds size limit")
+            body = response.read(MAX_REPLICA_RESPONSE_BYTES + 1)
+        if len(body) > MAX_REPLICA_RESPONSE_BYTES:
+            raise ValueError("replication response exceeds size limit")
+        payload = json.loads(body)
+        if not isinstance(payload, dict):
+            raise ValueError("replication response is not an object")
+        return payload
+
+    def _sync_table(self, table: str) -> None:
+        while not self._stop.is_set():
+            cursor = self._cursor(table)
+            batch = self._fetch(table, cursor)
+            source = batch.get("source") or {}
+            source_id = str(source.get("id") or "")
+            if self._source_id and source_id != self._source_id:
+                raise ValueError("edge historian identity changed")
+            expected = self.expected_source_id or self._source_id
+            result = self.store.import_replication_batch(
+                batch,
+                expected_source_id=expected,
+            )
+            self._source_id = str(result["source_id"])
+            self._source_hostname = str(result["hostname"])
+            imported = int(result["imported"])
+            with self._lock:
+                self._rows_imported += imported
+                if table == "fast_sample":
+                    self._last_sample_at = iso_from_us(
+                        int(result["cursor"]["key"])
+                    )
+                elif table == "platform_sample":
+                    self._last_platform_at = iso_from_us(
+                        int(result["cursor"]["key"])
+                    )
+            self._set_connection(True)
+            if not batch.get("has_more"):
+                return
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                if not self._check_disk():
+                    raise RuntimeError(
+                        "replica writes stopped at the free-space boundary"
+                    )
+                for table in REPLICATION_TABLES:
+                    self._sync_table(table)
+                    if self._stop.is_set():
+                        return
+                monotonic = time.monotonic()
+                if monotonic - self._last_checkpoint_monotonic >= 300:
+                    self.store.checkpoint()
+                    self._last_checkpoint_monotonic = monotonic
+                if monotonic - self._last_retention_monotonic >= 3600:
+                    self.store.apply_retention()
+                    self._last_retention_monotonic = monotonic
+            except (
+                OSError,
+                TimeoutError,
+                urllib.error.URLError,
+                ValueError,
+                RuntimeError,
+                sqlite3.Error,
+            ) as error:
+                message = f"{type(error).__name__}: {error}"
+                with self._lock:
+                    self._sync_errors += 1
+                self._set_connection(False, message)
+            self._stop.wait(self.poll_seconds)
+
+
 class ThreadingUnixHTTPServer(
     socketserver.ThreadingMixIn,
     socketserver.UnixStreamServer,
@@ -1392,7 +2153,7 @@ class ThreadingUnixHTTPServer(
         address: str,
         handler: type[BaseHTTPRequestHandler],
         store: HistorianStore,
-        recorder: HistorianRecorder,
+        recorder: HistorianRecorder | ReplicaRecorder,
     ) -> None:
         super().__init__(address, handler)
         self.store = store
@@ -1494,6 +2255,24 @@ class HistorianHandler(BaseHTTPRequestHandler):
                         ],
                     }
                 )
+            elif split.path == "/replication":
+                table = str(query.get("table", [""])[0])
+                after_key = int(query.get("after", ["0"])[0])
+                after_tie = int(query.get("after_tie", ["0"])[0])
+                limit = int(
+                    query.get(
+                        "limit",
+                        [str(DEFAULT_REPLICA_BATCH_SIZE)],
+                    )[0]
+                )
+                self._json(
+                    self.historian.store.replication_batch(
+                        table,
+                        after_key,
+                        after_tie,
+                        limit=limit,
+                    )
+                )
             elif split.path == "/query":
                 start, end = self._range(query)
                 paths = tuple(
@@ -1581,6 +2360,7 @@ def main() -> None:
     database = Path(os.environ.get("GIZMO_HISTORIAN_DATABASE", DEFAULT_DATABASE))
     socket_path = Path(os.environ.get("GIZMO_HISTORIAN_SOCKET", DEFAULT_SOCKET))
     endpoint = os.environ.get("GIZMO_HISTORIAN_OPCUA_ENDPOINT", DEFAULT_ENDPOINT)
+    replica_url = os.environ.get("GIZMO_HISTORIAN_REPLICA_URL", "").strip()
     capture_interval = positive_float(
         "GIZMO_HISTORIAN_CAPTURE_INTERVAL_SECONDS",
         DEFAULT_CAPTURE_INTERVAL,
@@ -1621,16 +2401,41 @@ def main() -> None:
         ),
     )
     store.initialize()
-    monitor = OpcUaMonitor(
-        endpoint,
-        positive_int("GIZMO_HISTORIAN_SUBSCRIPTION_MS", 500),
-    )
-    recorder = HistorianRecorder(
-        store,
-        monitor,
-        capture_interval=capture_interval,
-        platform_interval=platform_interval,
-    )
+    if replica_url:
+        replica_batch_size = positive_int(
+            "GIZMO_HISTORIAN_REPLICA_BATCH_SIZE",
+            DEFAULT_REPLICA_BATCH_SIZE,
+        )
+        if replica_batch_size > MAX_REPLICA_BATCH_SIZE:
+            raise SystemExit(
+                "GIZMO_HISTORIAN_REPLICA_BATCH_SIZE exceeds the safe maximum"
+            )
+        recorder: HistorianRecorder | ReplicaRecorder = ReplicaRecorder(
+            store,
+            replica_url,
+            poll_seconds=positive_float(
+                "GIZMO_HISTORIAN_REPLICA_POLL_SECONDS",
+                DEFAULT_REPLICA_POLL_SECONDS,
+            ),
+            batch_size=replica_batch_size,
+            expected_source_id=os.environ.get(
+                "GIZMO_HISTORIAN_REPLICA_SOURCE_ID",
+                "",
+            ),
+        )
+        source_description = f"edge replica {replica_url}"
+    else:
+        monitor = OpcUaMonitor(
+            endpoint,
+            positive_int("GIZMO_HISTORIAN_SUBSCRIPTION_MS", 500),
+        )
+        recorder = HistorianRecorder(
+            store,
+            monitor,
+            capture_interval=capture_interval,
+            platform_interval=platform_interval,
+        )
+        source_description = f"OPC UA {endpoint}"
     socket_path.parent.mkdir(parents=True, exist_ok=True, mode=0o775)
     if socket_path.exists() or socket_path.is_socket():
         socket_path.unlink()
@@ -1653,7 +2458,7 @@ def main() -> None:
     recorder.start()
     print(
         f"GIZMo historian storing {database}; query socket {socket_path}; "
-        f"OPC UA {endpoint}",
+        f"{source_description}",
         flush=True,
     )
     try:

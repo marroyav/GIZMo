@@ -167,12 +167,19 @@ The socket supports:
 | `/query` | bounded raw or rollup time-series query |
 | `/events` | bounded transition query |
 | `/export.csv` | bounded CSV export |
+| `/replication` | bounded raw batches for off-board replication |
 | `/healthz` | status alias for service checks |
 
 The dashboard exposes the corresponding same-origin
-`/api/history/{status,series,query,events,export.csv}` routes. It forwards only
+`/api/history/{status,series,query,events,export.csv,replication}` routes. It forwards only
 the fixed GET routes, while the historian validates every parameter; neither
 the Unix socket nor SQLite file is exposed.
+
+When `GIZMO_HISTORIAN_REPLICA_URL` is set, the same process runs in replica
+mode instead of opening its own OPC UA recording session. It pins the edge
+machine identity, imports raw batches transactionally, and keeps per-table
+cursors in the destination database. This mode is intended for independent
+off-board replicas; the Kria itself must run normal recording mode.
 
 Query rules:
 
