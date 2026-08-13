@@ -41,6 +41,8 @@
 #endif
 
 #define GIZMO_STATE_FILE(name) GIZMO_STATE_DIR "/" name
+#define GIZMO_THRESHOLD_MIN_OHM 0
+#define GIZMO_THRESHOLD_MAX_OHM 1023
 
 #define nTerp 65               // For interpolating data
 
@@ -82,7 +84,7 @@ void LoadCapacitance(const char *filename);
 
 
 //---------------------
-int global_th = 2000;
+int global_th = 100;
 volatile uint32_t *_gpio_1;
 volatile uint32_t *_gpio_0;
 volatile uint32_t *_gpio_2;
@@ -884,7 +886,8 @@ void parse(const char *cmd)
     {
         int th;
         //int val;
-        if (sscanf(cmd + 7, "%d", &th) > 0)
+        if (sscanf(cmd + 7, "%d", &th) > 0 &&
+            th >= GIZMO_THRESHOLD_MIN_OHM && th <= GIZMO_THRESHOLD_MAX_OHM)
         {
             printf("setting Alarm threshold to =%d\r\n", th);
             global_th = th;
@@ -1218,7 +1221,22 @@ void LoadTH(const char *filename)
     char line[128];
     while (fgets(line, sizeof(line), file)) {
         if (strncmp(line, "export threshold=", 17) == 0) {
-            global_th = atoi(line + 17);
+            char *end = NULL;
+            long threshold;
+            errno = 0;
+            threshold = strtol(line + 17, &end, 10);
+            while (end && isspace((unsigned char)*end)) {
+                ++end;
+            }
+            if (errno == 0 && end && *end == '\0' &&
+                threshold >= GIZMO_THRESHOLD_MIN_OHM &&
+                threshold <= GIZMO_THRESHOLD_MAX_OHM) {
+                global_th = (int)threshold;
+            } else {
+                fprintf(stderr,
+                        "Ignoring stored threshold outside %d..%d ohms\n",
+                        GIZMO_THRESHOLD_MIN_OHM, GIZMO_THRESHOLD_MAX_OHM);
+            }
             break;
         }
     }

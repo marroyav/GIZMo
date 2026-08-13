@@ -26,8 +26,10 @@ from gizmo_common import read_exported_int, state_path
 
 MODEL_NAMESPACE_URI = "urn:fnal:gizmo"
 LEGACY_NAMESPACE_URI = "SimpleOPCUAServer"
-MODEL_VERSION = "1.3.0"
-MODEL_PUBLICATION_DATE = dt.datetime(2026, 7, 27, tzinfo=dt.timezone.utc)
+MODEL_VERSION = "1.3.1"
+MODEL_PUBLICATION_DATE = dt.datetime(2026, 8, 13, tzinfo=dt.timezone.utc)
+THRESHOLD_MIN_OHM = 0
+THRESHOLD_MAX_OHM = 1023
 
 QUALITY_GOOD = "Good"
 QUALITY_UNCERTAIN = "Uncertain"

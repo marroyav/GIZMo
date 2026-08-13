@@ -35,7 +35,8 @@ echo "ok   shell syntax"
 PYTHONPYCACHEPREFIX="$temporary/pycache" "$test_python" -m compileall -q \
     "$repo_root/src/python" "$repo_root/tests"
 PYTHONPYCACHEPREFIX="$temporary/pycache" "$test_python" -m py_compile \
-    "$repo_root/scripts/gizmo-opcua-client"
+    "$repo_root/scripts/gizmo-opcua-client" \
+    "$repo_root/tools/generate-opcua-contract.py"
 echo "ok   Python syntax"
 
 PYTHONPYCACHEPREFIX="$temporary/pycache" "$test_python" \
@@ -58,6 +59,9 @@ PYTHONPYCACHEPREFIX="$temporary/pycache" "$test_python" \
 echo "ok   persistent historian tests"
 
 if "$test_python" -c 'import numpy, opcua, zmq' >/dev/null 2>&1; then
+    PYTHONPYCACHEPREFIX="$temporary/pycache" "$test_python" \
+        "$repo_root/tools/generate-opcua-contract.py" --check
+    echo "ok   generated OPC UA contract freshness"
     PYTHONPYCACHEPREFIX="$temporary/pycache" "$test_python" \
         "$repo_root/tests/test_opcua_address_space.py"
     echo "ok   OPC UA address-space integration tests"

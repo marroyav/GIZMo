@@ -12,9 +12,11 @@ persistent historian, and web-dashboard components. Systemd owns startup
 ordering, privileges, restarts, logs, and shutdown. Operators still start and
 stop the product as one unit.
 
-> Status: runtime 0.4.5 is the maintained package. It adds an explicit
-> unlimited-retention policy for permanent off-board replicas while keeping
-> the Kria historian as a bounded 14-day edge buffer. Runtime 0.4.4 added
+> Status: runtime 0.4.6 is the maintained package. It publishes OPC UA model
+> 1.3.1 as the authoritative GIZMo--Slow Controls interface contract and adds
+> a deterministic machine-readable contract artifact. Runtime 0.4.5 added an
+> explicit unlimited-retention policy for permanent off-board replicas while
+> keeping the Kria historian as a bounded 14-day edge buffer. Runtime 0.4.4 added
 > cursor-based recovery to independent replicas and package-owned boot-time
 > synchronization through site-managed NTP sources. Runtime 0.4.3 added the
 > ZMon measurement engine's authoritative
@@ -91,9 +93,10 @@ ARM64 wheel hashes are pinned in
 build.
 
 The supported monitoring and control contract is the typed OPC UA namespace
-`urn:fnal:gizmo` on TCP 4840. It exposes measurement quality and source
-timestamps along with OS, network, firmware, time, service, calibration, and
-SDR status:
+`urn:fnal:gizmo`. The Kria serves it on TCP 4840, and the legacy ZedBoard
+serves the same baseline model on TCP 4842 at its separately configured host.
+It exposes measurement quality and source timestamps along with OS, network,
+firmware, time, service, calibration, and SDR status:
 
 ```sh
 gizmo-opcua-client health
@@ -105,6 +108,13 @@ gizmo-opcua-client schema
 See [the OPC UA contract](docs/opcua.md). The recovered
 `SimpleOPCUAServer/CommandObject` namespace and text ZeroMQ API remain as
 compatibility interfaces during migration.
+
+The versioned machine-readable authority is
+[`schema/gizmo-opcua-contract.json`](schema/gizmo-opcua-contract.json). The
+Kria address-space builder generates it, and both platform implementations
+conform to it rather than defining separate schemas. The shared contract
+accepts threshold writes from 0 through 1023 ohms on both platforms. Hardware
+gaps remain visible through access levels and non-good OPC UA status codes.
 
 The generic off-board replica design is described in the
 [off-board monitoring guide](docs/offboard-monitoring.md). The reusable
@@ -152,7 +162,7 @@ Read [the migration procedure](docs/migration.md) before touching a running
 legacy image. The safe high-level sequence is:
 
 ```sh
-sudo dpkg -i build/gizmo-runtime_0.4.5_arm64.deb
+sudo dpkg -i build/gizmo-runtime_0.4.6_arm64.deb
 sudo gizmo-doctor
 ```
 

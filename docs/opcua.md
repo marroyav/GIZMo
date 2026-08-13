@@ -8,14 +8,38 @@ The supported public machine interface is the OPC UA namespace:
 urn:fnal:gizmo
 ```
 
-It is served at `opc.tcp://<gizmo-address>:4840`. With the default
-configuration, UA service messages and `DataValue` instances use OPC UA Binary
-over UA TCP. OPC UA supplies the wire encoding, type identifiers, browsing,
-reads, writes, methods, subscriptions, status codes, and timestamps; no
-Protobuf schema or telemetry ports are required.
+The Kria serves it at `opc.tcp://<gizmo-address>:4840`. A conforming legacy
+ZedBoard serves the same baseline model on TCP 4842 at its separately assigned
+address. With the default configuration, UA service messages and `DataValue`
+instances use OPC UA Binary over UA TCP. OPC UA supplies the wire encoding,
+type identifiers, browsing, reads, writes, methods, subscriptions, status
+codes, and timestamps; no Protobuf schema or telemetry ports are required.
 
 Clients must resolve the namespace URI at connection time. They must not assume
 that its runtime namespace index is always `3`.
+
+The Kria implementation is the authority for canonical NodeIds, browse
+metadata, datatypes, ranks, units, ranges, status/timestamp semantics, and
+method signatures. The ZedBoard is a separate conforming producer; platform
+capability is conveyed through access levels, write results, and StatusCodes.
+On the ZedBoard, anonymous sessions and all variables except
+`Configuration.ThresholdOhm` are read-only. An authenticated control session
+may write that one variable from 0 through 1023 ohms. ZedBoard operation
+methods return `BadNotSupported`.
+
+The machine-readable contract is
+[`schema/gizmo-opcua-contract.json`](../schema/gizmo-opcua-contract.json). It
+is generated from the Kria address-space builder and is the normative baseline
+for both implementations: 43 objects, 457 variables, and 5 methods in model
+1.3.1. It records stable NodeIds, parent objects, browse names, descriptions,
+datatypes, `ValueRank`, units, engineering ranges, method arguments, and the
+Kria access contract. Its embedded SHA-256 covers the canonical JSON content
+excluding the hash field itself.
+
+Runtime inventory may add deterministic children only where the artifact's
+extension policy permits it; it may not change an existing NodeId, datatype,
+rank, range, or physical meaning. The two servers keep distinct endpoint and
+device identities; neither proxies, starts, stops, or configures the other.
 
 The model version is available at the stable string NodeId:
 
@@ -83,6 +107,10 @@ is retained with `UncertainLastUsableValue`. Before the first sample, values use
 
 Physical variables expose the standard OPC UA `EngineeringUnits` property.
 Descriptions are AddressSpace attributes and can be browsed by generic clients.
+The authoritative `Configuration.ThresholdOhm` contract is the unsigned-integer
+range 0 through 1023 ohms on both Kria and ZedBoard. Both implementations
+reject larger values before forwarding them to hardware, and OPC UA writes
+return `BadOutOfRange`.
 
 `ResistanceOhm` is a physical value only when
 `ResistanceRange = InRange`. A raw result above the validated 500-ohm
@@ -130,6 +158,12 @@ gizmo-opcua-client capture-adc
 gizmo-opcua-client normalize-magnitude
 gizmo-opcua-client set-time 2026-07-27T09:15:00-06:00
 ```
+
+The legacy ZedBoard accepts only authenticated `set-threshold` writes. Select
+its site-configured TCP 4842 endpoint and pass the controlled deployment
+username with `--username`; the client prompts for its password without echo.
+Other legacy configuration writes and all legacy methods return an explicit
+non-good StatusCode.
 
 Generic OPC UA clients can browse or subscribe without this utility.
 

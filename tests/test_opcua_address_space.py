@@ -95,8 +95,29 @@ class AddressSpaceTests(unittest.TestCase):
         )
         self.assertEqual(
             self.node("Identity.ModelVersion").get_value(),
-            "1.3.0",
+            "1.3.1",
         )
+
+    def test_threshold_range_is_uniform_across_platforms(self) -> None:
+        threshold = self.node("Configuration.ThresholdOhm")
+        engineering_range = threshold.get_child(["0:EURange"]).get_value()
+
+        self.assertEqual(
+            (engineering_range.Low, engineering_range.High),
+            (0, 1023),
+        )
+
+    def test_threshold_above_contract_limit_is_not_forwarded(self) -> None:
+        threshold = self.node("Configuration.ThresholdOhm")
+        previous = self.server._last_threshold
+        threshold.set_value(ua.Variant(1024, ua.VariantType.UInt32))
+
+        with mock.patch.object(self.server, "request") as request:
+            with self.assertRaisesRegex(ValueError, "between 0 and 1023"):
+                self.server._forward_configuration_writes()
+
+        request.assert_not_called()
+        self.assertEqual(threshold.get_value(), previous)
 
     def test_legacy_command_object_is_preserved(self) -> None:
         legacy_namespace = self.client.get_namespace_index("SimpleOPCUAServer")
