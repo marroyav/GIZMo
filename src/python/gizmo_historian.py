@@ -381,6 +381,7 @@ class HistorianStore:
         platform_retention_days: int = DEFAULT_PLATFORM_RETENTION_DAYS,
         rollup_retention_days: int = DEFAULT_ROLLUP_RETENTION_DAYS,
         event_retention_days: int = DEFAULT_EVENT_RETENTION_DAYS,
+        retention_enabled: bool = True,
         max_query_points: int = DEFAULT_MAX_QUERY_POINTS,
         max_export_rows: int = DEFAULT_MAX_EXPORT_ROWS,
         min_free_bytes: int = DEFAULT_MIN_FREE_BYTES,
@@ -390,6 +391,7 @@ class HistorianStore:
         self.platform_retention_days = platform_retention_days
         self.rollup_retention_days = rollup_retention_days
         self.event_retention_days = event_retention_days
+        self.retention_enabled = retention_enabled
         self.max_query_points = max_query_points
         self.max_export_rows = max_export_rows
         self.min_free_bytes = min_free_bytes
@@ -837,7 +839,11 @@ class HistorianStore:
             raise ValueError(f"series is not retained: {sorted(unknown)[0]}")
         if end_us <= start_us:
             raise ValueError("history end must be after start")
-        if end_us - start_us > self.event_retention_days * 86400 * 1_000_000:
+        if (
+            self.retention_enabled
+            and end_us - start_us
+            > self.event_retention_days * 86400 * 1_000_000
+        ):
             raise ValueError("history interval exceeds retention boundary")
         limit = max_points or self.max_query_points
         if not 1 <= limit <= self.max_export_rows:
@@ -1077,6 +1083,14 @@ class HistorianStore:
         return output.getvalue().encode()
 
     def apply_retention(self, reference_us: int | None = None) -> dict[str, int]:
+        tables = (
+            "fast_sample",
+            "platform_sample",
+            "minute_rollup",
+            "event",
+        )
+        if not self.retention_enabled:
+            return {table: 0 for table in tables}
         reference = reference_us or now_us()
         cutoffs = {
             "fast_sample": reference
@@ -1641,6 +1655,7 @@ class HistorianStore:
                 "rollup": self.rollup_retention_days,
                 "event": self.event_retention_days,
             },
+            "retention_enabled": self.retention_enabled,
             "projected_month_bytes_from_payloads": estimate,
         }
 
@@ -2349,6 +2364,15 @@ def positive_int(name: str, default: int, *, minimum: int = 1) -> int:
     return value
 
 
+def boolean_env(name: str, default: bool) -> bool:
+    value = os.environ.get(name, "1" if default else "0").strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise SystemExit(f"{name} must be a Boolean value")
+
+
 def positive_float(name: str, default: float) -> float:
     value = float(os.environ.get(name, str(default)))
     if not math.isfinite(value) or value <= 0:
@@ -2386,6 +2410,10 @@ def main() -> None:
         event_retention_days=positive_int(
             "GIZMO_HISTORIAN_EVENT_RETENTION_DAYS",
             DEFAULT_EVENT_RETENTION_DAYS,
+        ),
+        retention_enabled=boolean_env(
+            "GIZMO_HISTORIAN_RETENTION_ENABLED",
+            True,
         ),
         max_query_points=positive_int(
             "GIZMO_HISTORIAN_MAX_QUERY_POINTS",

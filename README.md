@@ -12,10 +12,12 @@ persistent historian, and web-dashboard components. Systemd owns startup
 ordering, privileges, restarts, logs, and shutdown. Operators still start and
 stop the product as one unit.
 
-> Status: runtime 0.4.4 is the maintained package. It keeps the Kria historian
-> as a 14-day edge buffer, adds cursor-based recovery to independent off-board
-> replicas, and package-owns boot-time synchronization through site-managed
-> NTP sources. Runtime 0.4.3 added the ZMon measurement engine's authoritative
+> Status: runtime 0.4.5 is the maintained package. It adds an explicit
+> unlimited-retention policy for permanent off-board replicas while keeping
+> the Kria historian as a bounded 14-day edge buffer. Runtime 0.4.4 added
+> cursor-based recovery to independent replicas and package-owned boot-time
+> synchronization through site-managed NTP sources. Runtime 0.4.3 added the
+> ZMon measurement engine's authoritative
 > composite relay/beacon alarm to OPC UA, the historian, and the full-width
 > operations dashboard. Runtime 0.4.0 was historian-restart tested, and
 > runtime 0.2.9 was cold-boot tested, on the borrowed instrument.
@@ -120,6 +122,14 @@ package-owned persistent history for longer intervals and CSV export. See
 The Kria clock is synchronized at boot with `systemd-timesyncd`; see the
 [time-synchronization guide](docs/time-synchronization.md).
 
+The human-facing connection, power-up, construction-monitoring guide and the
+dual-platform Slow Controls ICD are maintained in
+[`marroyav/gizmo-icd`](https://github.com/marroyav/gizmo-icd). The Ignition
+resources are maintained separately in
+[`marroyav/gizmo-ignition`](https://github.com/marroyav/gizmo-ignition), and
+the publication-safe archive schema is in
+[`marroyav/gizmo-data-archive`](https://github.com/marroyav/gizmo-data-archive).
+
 Local historian inspection is intentionally restricted to privileged
 operators:
 
@@ -142,7 +152,7 @@ Read [the migration procedure](docs/migration.md) before touching a running
 legacy image. The safe high-level sequence is:
 
 ```sh
-sudo dpkg -i build/gizmo-runtime_0.4.4_arm64.deb
+sudo dpkg -i build/gizmo-runtime_0.4.5_arm64.deb
 sudo gizmo-doctor
 ```
 

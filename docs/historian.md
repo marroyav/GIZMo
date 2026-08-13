@@ -85,7 +85,7 @@ The database is:
 It is owned by `gizmo:gizmo`; the containing directory is mode `0750`.
 Package upgrades and removal retain it with the other device-specific state.
 
-Schema version 1 contains:
+Schema version 2 contains:
 
 | Table | Contents |
 |---|---|
@@ -120,6 +120,18 @@ Retention runs hourly and returns free pages incrementally. The recorder stops
 new writes if available filesystem space falls below the larger of 2 GiB or
 15% of filesystem capacity. It continues checking for recovery and reports
 the limited state and dropped-sample count through `/status`.
+
+`GIZMO_HISTORIAN_RETENTION_ENABLED=0` explicitly disables age-based pruning
+for a permanent off-board replica. The configured day values remain visible
+as policy metadata, but no table is pruned and queries are not restricted to
+the event-retention interval. The Kria configuration keeps retention enabled;
+unlimited retention is not appropriate for its eMMC.
+
+Replication transfers inserts and updated rollups, never deletions. A row
+already committed to a replica therefore remains until that replica's own
+policy or an operator removes it. A replica disconnected beyond the Kria raw
+retention window cannot reconstruct one-second rows that expired before they
+were copied.
 
 ### Measured storage budget
 
@@ -236,7 +248,8 @@ journal output, or environment secrets.
 
 - The server does not implement OPC UA Historical Access (`HistoryRead`);
   history is available through the read-only dashboard/Unix HTTP API.
-- There is no automatic off-board replication or backup.
+- Cursor-based off-board replication is implemented, but deployment,
+  monitoring, immutable backup, and restore testing remain site-owned.
 - Event markers are retained and queryable but are not yet overlaid on the
   trend canvas.
 - The short storage replay verifies layout and integrity, but a 24-hour board

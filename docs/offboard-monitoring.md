@@ -48,6 +48,21 @@ The raw edge buffer is 14 days. An outage longer than that can still recover
 retained minute rollups and events, but expired one-second rows cannot be
 reconstructed. Monitor replica lag and storage headroom.
 
+## Permanent server retention
+
+The Kria uses bounded retention to protect its eMMC. A permanent off-board
+replica sets:
+
+```text
+GIZMO_HISTORIAN_RETENTION_ENABLED=0
+```
+
+That setting disables age-based pruning, not the free-space guard. At the
+measured planning rate of approximately 1.48 GB per continuously operating
+month, provision at least 25 GB for the first year plus filesystem and backup
+overhead, then expand or archive under the experiment records plan. Unlimited
+retention is not a substitute for an immutable, restore-tested backup.
+
 ## Operations
 
 Use a dedicated locked service identity, automatic restart, a read-only

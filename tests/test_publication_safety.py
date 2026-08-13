@@ -16,10 +16,13 @@ class PublicationSafetyTests(unittest.TestCase):
     def test_public_defaults_fail_closed(self) -> None:
         network = (ROOT / "config/network.env.example").read_text()
         runtime = (ROOT / "config/runtime.env").read_text()
+        replica = (ROOT / "deploy/offboard/runtime.env.example").read_text()
         server = (ROOT / "src/python/gizmo_opcua.py").read_text()
         self.assertIn("GIZMO_NETWORK_MODE=none", network)
         self.assertIn("GIZMO_OPCUA_ALLOW_INSECURE=0", runtime)
         self.assertIn('os.environ.get("GIZMO_OPCUA_ALLOW_INSECURE", "0")', server)
+        self.assertIn("GIZMO_HISTORIAN_RETENTION_ENABLED=1", runtime)
+        self.assertIn("GIZMO_HISTORIAN_RETENTION_ENABLED=0", replica)
 
     def test_controlled_paths_are_absent(self) -> None:
         for relative in (

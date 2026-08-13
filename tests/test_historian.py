@@ -251,6 +251,50 @@ class HistorianTests(unittest.TestCase):
         self.assertEqual(removed["platform_sample"], 1)
         self.assertEqual(self.store.storage_status()["fast_samples"]["count"], 0)
 
+    def test_disabled_retention_preserves_full_replica_history(self) -> None:
+        database = Path(self.temporary.name) / "unlimited-history.sqlite3"
+        store = historian.HistorianStore(
+            database,
+            raw_retention_days=14,
+            platform_retention_days=30,
+            rollup_retention_days=365,
+            event_retention_days=1825,
+            retention_enabled=False,
+            min_free_bytes=1,
+        )
+        store.initialize()
+        try:
+            stream = store.begin_stream("boot-unlimited", 1, "test")
+            receive_time_us, _ = store.record_fast(fake_snapshot(1), stream)
+            store.record_platform(fake_snapshot(1))
+            removed = store.apply_retention(
+                receive_time_us + 10_000 * 86400 * 1_000_000
+            )
+
+            self.assertEqual(
+                removed,
+                {
+                    "fast_sample": 0,
+                    "platform_sample": 0,
+                    "minute_rollup": 0,
+                    "event": 0,
+                },
+            )
+            status = store.storage_status()
+            self.assertFalse(status["retention_enabled"])
+            self.assertEqual(status["fast_samples"]["count"], 1)
+            self.assertEqual(status["platform_samples"]["count"], 1)
+
+            query = store.query(
+                ("Measurement.ResistanceOhm",),
+                receive_time_us - 1,
+                receive_time_us + 2_000 * 86400 * 1_000_000,
+                max_points=10,
+            )
+            self.assertEqual(query["point_count"], 1)
+        finally:
+            store.close()
+
     def test_cursor_replication_is_raw_atomic_and_idempotent(self) -> None:
         first = fake_snapshot(1)
         second = fake_snapshot(2, high_z=True)
@@ -395,6 +439,7 @@ class HistorianTests(unittest.TestCase):
         http_thread.start()
         replica = historian.HistorianStore(
             Path(self.temporary.name) / "network-replica.sqlite3",
+            retention_enabled=False,
             min_free_bytes=1,
         )
         replica.initialize()
