@@ -110,10 +110,10 @@ persistent latch state maintained by the engine.
 The package installs `gizmo-opcua-client`:
 
 ```sh
-gizmo-opcua-client --endpoint opc.tcp://<redacted-private-ip>:4840 health
-gizmo-opcua-client --endpoint opc.tcp://<redacted-private-ip>:4840 measurement
-gizmo-opcua-client --endpoint opc.tcp://<redacted-private-ip>:4840 snapshot
-gizmo-opcua-client --endpoint opc.tcp://<redacted-private-ip>:4840 schema
+gizmo-opcua-client --endpoint opc.tcp://gizmo-device.example.invalid:4840 health
+gizmo-opcua-client --endpoint opc.tcp://gizmo-device.example.invalid:4840 measurement
+gizmo-opcua-client --endpoint opc.tcp://gizmo-device.example.invalid:4840 snapshot
+gizmo-opcua-client --endpoint opc.tcp://gizmo-device.example.invalid:4840 schema
 ```
 
 The snapshot command omits the large SDR frame unless
@@ -170,13 +170,12 @@ OPC UA PubSub UADP mapping while retaining the same public information model.
 
 ## Security
 
-The recovered deployment has no certificate infrastructure, so
-`GIZMO_OPCUA_ALLOW_INSECURE=1` enables anonymous `SecurityPolicy None` on the
-isolated controls network. Serialization is not encryption.
+The source-only public configuration sets `GIZMO_OPCUA_ALLOW_INSECURE=0`, so
+the server fails closed until the controlled site workflow supplies a
+certificate, private key, cryptography support, trust list, and operator-role
+policy. Changing certificate paths alone is not a complete security boundary.
 
-The server code can load a certificate and private key and disable
-`SecurityPolicy None`, but the recovered offline dependency set does not yet
-bundle Python cryptography support or implement the site certificate trust
-list and operator-role policy. Those pieces must be supplied and validated
-before setting `GIZMO_OPCUA_ALLOW_INSECURE=0`; changing the three environment
-values alone is not sufficient for an untrusted network.
+An explicitly approved, isolated bench test may set
+`GIZMO_OPCUA_ALLOW_INSECURE=1` to enable anonymous `SecurityPolicy None`.
+Serialization is not encryption; that mode must never be exposed beyond the
+restricted bench network.

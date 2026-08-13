@@ -1,6 +1,21 @@
 /build/
 /.venv/
+/controlled-assets/
+/config/network.env
+/config/60-gizmo-timesyncd.conf
 __pycache__/
 *.py[cod]
 *.swp
 *~
+
+# Operational data and device images never belong in the public repository.
+*.db
+*.sqlite
+*.sqlite3
+*.img
+*.bin
+*.dtbo
+*.pem
+*.key
+*.p12
+*.pfx

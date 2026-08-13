@@ -6,12 +6,12 @@ if [ -r "$config_file" ]; then
     . "$config_file"
 fi
 
-: "${GIZMO_NETWORK_MODE:=static}"
+: "${GIZMO_NETWORK_MODE:=none}"
 : "${GIZMO_PS0_INTERFACE:=eth0}"
-: "${GIZMO_PS0_ADDRESS:=<redacted-private-ip>/24}"
+: "${GIZMO_PS0_ADDRESS:=}"
 : "${GIZMO_PS1_INTERFACE:=eth1}"
-: "${GIZMO_PS1_ADDRESS:=<redacted-private-ip>/24}"
-: "${GIZMO_DEFAULT_GATEWAY:=<redacted-private-ip>}"
+: "${GIZMO_PS1_ADDRESS:=}"
+: "${GIZMO_DEFAULT_GATEWAY:=}"
 
 validate_interface()
 {
@@ -37,6 +37,20 @@ configure_static_interface()
     ip address add "$address" dev "$interface"
 }
 
+validate_static_configuration()
+{
+    if [ -z "$GIZMO_PS0_ADDRESS" ] || [ -z "$GIZMO_PS1_ADDRESS" ]; then
+        echo "Static mode requires site-assigned PS0 and PS1 addresses" >&2
+        return 1
+    fi
+    case "$GIZMO_PS0_ADDRESS $GIZMO_PS1_ADDRESS $GIZMO_DEFAULT_GATEWAY" in
+        *192.0.2.*|*198.51.100.*|*203.0.113.*|*example.invalid*|*'<'*|*'>'*)
+            echo "Refusing documentation placeholder network values" >&2
+            return 1
+            ;;
+    esac
+}
+
 case "$GIZMO_NETWORK_MODE" in
     none)
         echo "Network configuration is externally managed"
@@ -52,6 +66,7 @@ case "$GIZMO_NETWORK_MODE" in
         exit 0
         ;;
     static)
+        validate_static_configuration
         configure_static_interface "$GIZMO_PS0_INTERFACE" "$GIZMO_PS0_ADDRESS"
         configure_static_interface "$GIZMO_PS1_INTERFACE" "$GIZMO_PS1_ADDRESS"
         if [ -n "$GIZMO_DEFAULT_GATEWAY" ]; then

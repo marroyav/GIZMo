@@ -22,8 +22,8 @@ match the live filesystem.
 
 1. waits for `/dev/i2c-6`;
 2. unloads and loads the overlay twice;
-3. assigns `<redacted-private-ip>/24` to `eth0`;
-4. assigns `<redacted-private-ip>/24` to `eth1`;
+3. assigns the controlled site address to `eth0`;
+4. assigns the controlled maintenance-link address to `eth1`;
 5. grants world access to `/dev/i2c-7`;
 6. creates `/dev/shm/rc.startup.done`.
 
@@ -37,7 +37,8 @@ processes remain in its cgroup. It starts:
 - `SDR2.py`
 - `OPC-UA-Server-Bridge.py`
 
-The exact custom unit and both scripts are retained under `legacy/live-root`.
+The exact custom unit and scripts remain in the controlled recovery archive;
+they are excluded from the public Git history.
 
 ## Interfaces and listeners
 
@@ -67,10 +68,11 @@ because HDL and project sources were not supplied.
 
 ## Recovered material
 
-The audit snapshot includes current C/Python sources, display sources and the
-previously missing Raspberry Pi platform port, configuration, calibration
-tables, startup files, and compiled overlay assets. The maintained calibration
-defaults match the live board by SHA-256.
+The controlled audit snapshot includes current C/Python sources, display
+sources and the previously missing Raspberry Pi platform port, configuration,
+calibration tables, startup files, and compiled overlay assets. None of those
+device-derived assets or their fingerprints are included in the public Git
+history.
 
 Excluded from the maintained package:
 

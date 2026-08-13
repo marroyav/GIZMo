@@ -9,7 +9,8 @@ http://<gizmo-address>:8080/
 ```
 
 For the current controls interface, use
-`http://<redacted-private-ip>:8080/`. The dashboard is hosted by the Kria so it
+`http://gizmo-device.example.invalid:8080/`. The reserved name is an example;
+use the site-assigned endpoint. The dashboard is hosted by the Kria so it
 continues to work on the private instrument network without a cloud service or
 an Internet route.
 

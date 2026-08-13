@@ -137,7 +137,7 @@ class GizmoOpcUaServer:
         certificate = os.environ.get("GIZMO_OPCUA_CERTIFICATE", "").strip()
         private_key = os.environ.get("GIZMO_OPCUA_PRIVATE_KEY", "").strip()
         allow_insecure = (
-            os.environ.get("GIZMO_OPCUA_ALLOW_INSECURE", "1").strip() == "1"
+            os.environ.get("GIZMO_OPCUA_ALLOW_INSECURE", "0").strip() == "1"
         )
         if bool(certificate) != bool(private_key):
             raise RuntimeError(

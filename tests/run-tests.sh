@@ -38,6 +38,10 @@ PYTHONPYCACHEPREFIX="$temporary/pycache" "$test_python" -m py_compile \
     "$repo_root/scripts/gizmo-opcua-client"
 echo "ok   Python syntax"
 
+PYTHONPYCACHEPREFIX="$temporary/pycache" "$test_python" \
+    "$repo_root/tests/test_publication_safety.py"
+echo "ok   public-tree safety checks"
+
 PYTHONPYCACHEPREFIX="$temporary/pycache" "$test_python" "$repo_root/tests/test_zmq_commands.py"
 echo "ok   command compatibility tests"
 
@@ -169,18 +173,16 @@ if ! grep -q 'gizmo-historian\.service' \
 fi
 echo "ok   historian lifecycle and storage ownership"
 
-if ! grep -q '^NTP=192\.168\.191\.90$' \
-        "$repo_root/config/60-gizmo-timesyncd.conf" ||
-    ! grep -q '^FallbackNTP=ntp\.fnal\.gov ' \
-        "$repo_root/config/60-gizmo-timesyncd.conf" ||
-    ! grep -q 'timesyncd\.conf\.d/60-gizmo\.conf' \
+if ! grep -q '^NTP=time-relay\.example\.invalid$' \
+        "$repo_root/config/60-gizmo-timesyncd.conf.example" ||
+    ! grep -q 'SITE_CONFIG_ROOT.*/60-gizmo-timesyncd\.conf' \
         "$repo_root/Makefile" ||
     ! grep -q 'enable --now systemd-timesyncd\.service' \
         "$repo_root/packaging/maintainer-scripts/postinst"; then
-    echo "Persistent Kria time synchronization is not package-owned" >&2
+    echo "Site-configured Kria time synchronization is not package-owned" >&2
     exit 1
 fi
-echo "ok   persistent Fermilab time synchronization"
+echo "ok   site-configured time synchronization"
 
 if grep -q '^Requires=' "$repo_root/packaging/systemd/gizmo.target" ||
     grep -q '^Requires=.*gizmo-zmon' \

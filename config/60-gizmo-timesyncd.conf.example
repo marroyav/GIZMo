@@ -1,0 +1,8 @@
+# Publication-safe example. Replace these reserved names with the approved site
+# time sources before installing this file.
+[Time]
+NTP=time-relay.example.invalid
+FallbackNTP=time1.example.invalid time2.example.invalid
+RootDistanceMaxSec=15
+PollIntervalMinSec=32
+PollIntervalMaxSec=2048

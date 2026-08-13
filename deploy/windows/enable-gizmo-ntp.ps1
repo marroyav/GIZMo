@@ -1,24 +1,26 @@
 #Requires -RunAsAdministrator
 
+param(
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
+    [string[]]$UpstreamPeers,
+
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
+    [string]$GizmoAddress
+)
+
 $ErrorActionPreference = "Stop"
 
 $provider = "HKLM:\SYSTEM\CurrentControlSet\Services\W32Time\TimeProviders\NtpServer"
 $ruleName = "GIZMo-NTP-PrivateLink"
-# Canonical list from fermilab-context-rpms/fermilab-conf_timesync.
-$fermilabPeers = @(
-    "<redacted-site-host>,0x9"
-    "<redacted-site-host>,0x9"
-    "<redacted-site-host>,0x9"
-    "<redacted-site-host>,0x9"
-    "<redacted-site-host>,0x9"
-    "<redacted-site-host>,0x9"
-) -join " "
+$manualPeers = ($UpstreamPeers | ForEach-Object { "$_,0x9" }) -join " "
 
 Set-ItemProperty -Path $provider -Name Enabled -Type DWord -Value 1
 Set-Service -Name W32Time -StartupType Automatic
 & w32tm.exe `
     /config `
-    /manualpeerlist:"$fermilabPeers" `
+    /manualpeerlist:"$manualPeers" `
     /syncfromflags:manual `
     /reliable:yes `
     /update | Out-Null
@@ -30,13 +32,13 @@ if ($null -ne $rule) {
 New-NetFirewallRule `
     -Name $ruleName `
     -DisplayName "GIZMo NTP on private maintenance link" `
-    -Description "Allow the GIZMo Kria to query this workstation for NTP." `
+    -Description "Allow only the configured GIZMo address to query this workstation for NTP." `
     -Enabled True `
     -Direction Inbound `
     -Action Allow `
     -Protocol UDP `
     -LocalPort 123 `
-    -RemoteAddress <redacted-private-ip> `
+    -RemoteAddress $GizmoAddress `
     -Profile Any | Out-Null
 
 Restart-Service -Name W32Time

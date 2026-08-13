@@ -20,6 +20,9 @@ def unused_tcp_port() -> int:
 PORT = unused_tcp_port()
 ENDPOINT = f"opc.tcp://127.0.0.1:{PORT}"
 os.environ["GIZMO_OPCUA_ENDPOINT"] = ENDPOINT
+# This integration test is loopback-only and deliberately exercises the
+# explicitly approved insecure-test mode. Production defaults fail closed.
+os.environ["GIZMO_OPCUA_ALLOW_INSECURE"] = "1"
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src" / "python"))
 

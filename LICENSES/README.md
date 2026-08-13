@@ -7,17 +7,15 @@ owner. Authorship and redistribution rights for the GIZMo-specific C, Python,
 FPGA bitstream, device tree, manuals, and calibration data must be confirmed
 with the firmware maintainers before public redistribution.
 
-The EVE display library contains Bridgetek copyright and license notices. Its
-license texts are retained at:
+The Bridgetek EVE dependency and its license files are not redistributed in
+this public edition. Obtain an approved copy through the controlled workflow;
+its terms apply independently.
 
-- `legacy/live-root/home/ubuntu/Software/EVE-main_Kria/lib/eve/LICENSE`
-- `legacy/live-root/home/ubuntu/Software/EVE-main_Kria/example/LICENSE`
+The public history also excludes the recovered live-root snapshot, FPGA and
+device-tree binaries, device-state/calibration bundle, supplied manuals, and
+legacy client. HDL, Vivado project sources, constraints, and an address-map
+source of truth were not available.
 
-Those terms apply independently to the corresponding files.
-
-The repository contains only the compiled FPGA overlay (`.bin` and `.dtbo`).
-It does not contain HDL, Vivado project sources, constraints, or an address-map
-source of truth.
-
-Until provenance is resolved, keep the repository private and do not publish
-release artifacts.
+Until provenance is resolved, do not publish release artifacts or copy
+controlled assets into this repository. The public source tree is provided for
+review only; it is not a grant of reuse or deployment rights.

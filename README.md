@@ -1,8 +1,10 @@
 # GIZMo Kria runtime
 
-This repository turns the recovered GIZMo Kria slow-controls release into one
-owned package, `gizmo-runtime`, with one operational entry point:
-`gizmo.target`.
+This source-only public edition turns the maintained GIZMo Kria slow-controls
+runtime into one package, `gizmo-runtime`, with one operational entry point:
+`gizmo.target`. Device images, recovered filesystem content, calibration/state
+bundles, site configuration, supplied manuals, and reviewed third-party
+dependencies are deliberately excluded.
 
 The package deliberately uses separate systemd services for the overlay,
 network, impedance monitor, display, ZeroMQ, temperature, SDR, OPC UA,
@@ -12,8 +14,8 @@ stop the product as one unit.
 
 > Status: runtime 0.4.4 is the maintained package. It keeps the Kria historian
 > as a 14-day edge buffer, adds cursor-based recovery to independent off-board
-> replicas, and package-owns boot-time synchronization through Fermilab's NTP
-> pool. Runtime 0.4.3 added the ZMon measurement engine's authoritative
+> replicas, and package-owns boot-time synchronization through site-managed
+> NTP sources. Runtime 0.4.3 added the ZMon measurement engine's authoritative
 > composite relay/beacon alarm to OPC UA, the historian, and the full-width
 > operations dashboard. Runtime 0.4.0 was historian-restart tested, and
 > runtime 0.2.9 was cold-boot tested, on the borrowed instrument.
@@ -35,29 +37,42 @@ stop the product as one unit.
 | persistent historian | `gizmo-historian.service` | private Unix socket | `gizmo` |
 | live and historical dashboard | `gizmo-dashboard.service` | HTTP 8080 | `gizmo` |
 
-Only the two Processing System Ethernet ports are configured. Defaults match
-the recovered board:
-
-- `eth0`: `<redacted-private-ip>/24`, default gateway `<redacted-private-ip>`
-- `eth1`: `<redacted-private-ip>/24`
-
-Edit `/etc/gizmo/network.env` to change them. Set
-`GIZMO_NETWORK_MODE=networkmanager` or `none` when another component owns the
-interfaces.
+Only the two Processing System Ethernet ports are supported. The public
+configuration defaults to `GIZMO_NETWORK_MODE=none`; it contains no deployment
+addresses. Copy `config/network.env.example` into the controlled site
+configuration, assign approved addresses, and select `static` only after
+review. The setup script refuses RFC 5737 example addresses.
 
 ## Build and test
 
-Host-side compilation and protocol/unit-file checks:
+Host-side compilation and protocol/unit-file checks do not require controlled
+device assets:
 
 ```sh
 make
 make test
 ```
 
-Build the target package natively on Ubuntu 22.04 ARM64:
+A full device build requires a controlled asset directory containing the
+reviewed EVE dependency, FPGA/device-tree overlays, device state, calibration
+tables, and approved network/time configuration:
+
+```text
+controlled-assets/
+├── eve/
+├── default-state/
+├── firmware/
+│   ├── GIZMo-Kria-3-7-25.dtbo
+│   └── xilinx/GIZMo_Kria_3_7_25/
+└── site-config/
+    ├── network.env
+    └── 60-gizmo-timesyncd.conf
+```
+
+Build it only from the controlled workflow:
 
 ```sh
-make deb
+make full CONTROLLED_ASSET_ROOT=/approved/path/to/controlled-assets
 ```
 
 The package builder installs the pinned Python runtime and its compiled wheels
@@ -65,7 +80,8 @@ inside `/usr/lib/gizmo/python`; it does not use Ubuntu's personal
 `~/.local` packages. A wheelhouse can be supplied for offline builds:
 
 ```sh
-WHEELHOUSE=/path/to/wheels make deb
+CONTROLLED_ASSET_ROOT=/approved/path/to/controlled-assets \
+  WHEELHOUSE=/path/to/wheels make deb
 ```
 
 ARM64 wheel hashes are pinned in
@@ -88,15 +104,14 @@ See [the OPC UA contract](docs/opcua.md). The recovered
 `SimpleOPCUAServer/CommandObject` namespace and text ZeroMQ API remain as
 compatibility interfaces during migration.
 
-The first independent off-board history replica and dashboard run on
-`<redacted-site-host>`; see the
+The generic off-board replica design is described in the
 [off-board monitoring guide](docs/offboard-monitoring.md). The reusable
-user-mode replica files are in `deploy/offboard/`. The replica mirrors the
-Kria edge historian and catches up automatically after a network or server
-outage.
+user-mode files are in `deploy/offboard/`; they contain only loopback endpoints
+and example paths. Hostnames, accounts, and storage locations remain site
+configuration.
 
-The board also serves a read-only console at
-`http://<gizmo-address>:8080/`. It uses one shared live OPC UA subscription,
+The board can also serve a read-only console at the site-assigned endpoint on
+TCP 8080. It uses one shared live OPC UA subscription,
 preserves value status codes, plots up to one hour in the browser, and queries
 package-owned persistent history for longer intervals and CSV export. See
 [the dashboard guide](docs/dashboard.md) and
@@ -113,11 +128,15 @@ sudo gizmo-historian-client status
 sudo gizmo-historian-client series
 ```
 
-On a non-Python-3.10 development host, a structure-only package can be checked
-with `BUNDLE_PYTHON_DEPS=0 make deb`. That artifact is not suitable for the
-Kria.
+On a non-Python-3.10 development host, use `make test`. A target package still
+requires the controlled assets and a native Ubuntu 22.04 ARM64/Python 3.10
+build environment.
 
 ## Install
+
+The public repository by itself cannot produce an installable device package.
+That is intentional: packaging fails closed unless the controlled inputs above
+are present.
 
 Read [the migration procedure](docs/migration.md) before touching a running
 legacy image. The safe high-level sequence is:
@@ -146,13 +165,14 @@ Calibration state is retained even when the package is purged.
 ## Repository layout
 
 - `src/`: maintained ZMon, privilege helper, and service sources
-- `config/`: package configuration and recovered device-state defaults
+- `config/`: publication-safe examples and non-site runtime policy
 - `packaging/`: systemd, udev, sysusers, tmpfiles, and `.deb` construction
-- `legacy/live-root/`: immutable audit snapshot from the working instrument
-- `docs/reference/`: supplied manuals
-- `tools/legacy/`: supplied legacy client
+- `deploy/`: parameterized off-board monitoring and time-relay examples
+- `docs/`: source-level architecture, operation, and security guidance
 
-The compiled overlay is present, but the Vivado/HDL project is not. See
-[the recovered-system inventory](docs/live-system-inventory.md) and
-[security notes](docs/security.md). Review the
-[licensing/provenance notes](LICENSES/README.md) before redistribution.
+The public history does not contain the recovered live-root snapshot, compiled
+overlay, device-tree blob, device-state bundle, calibration tables, supplied
+manuals, live database, credentials, or site topology. See the
+[recovered-system inventory](docs/live-system-inventory.md),
+[security notes](docs/security.md), and
+[licensing/provenance notes](LICENSES/README.md).

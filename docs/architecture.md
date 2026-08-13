@@ -79,7 +79,7 @@ where the wall clock changed but the hardware RTC did not.
 | `/usr/share/gizmo/dashboard` | self-contained browser assets | package only |
 | `/lib/firmware/xilinx/GIZMo_Kria_3_7_25` | compiled overlay | package only |
 | `/etc/gizmo` | administrator configuration | dpkg conffiles |
-| `/usr/share/gizmo/default-state` | factory/recovered defaults | package only |
+| `/usr/share/gizmo/default-state` | controlled device-state bundle | package only |
 | `/var/lib/gizmo` | calibration, latch, ADC, runtime arguments | services/operator |
 | `/var/lib/gizmo/history` | retained SQLite telemetry | historian only |
 | `/run/gizmo` | control and historian sockets | transient |
