@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import getpass
 import json
 import math
 import os
@@ -24,6 +25,8 @@ NAMESPACE_URI = "urn:fnal:gizmo"
 DEFAULT_ENDPOINT = os.environ.get(
     "GIZMO_OPCUA_CLIENT_ENDPOINT", "opc.tcp://127.0.0.1:4840"
 )
+THRESHOLD_MIN_OHM = 0
+THRESHOLD_MAX_OHM = 1_000_000
 
 
 def json_value(value: Any) -> Any:
@@ -146,6 +149,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--endpoint", default=DEFAULT_ENDPOINT)
     parser.add_argument("--timeout", type=float, default=5.0)
+    parser.add_argument(
+        "--username",
+        default=os.environ.get("GIZMO_OPCUA_CLIENT_USERNAME", ""),
+        help=(
+            "OPC UA control username; when set, the password is read from "
+            "GIZMO_OPCUA_CLIENT_PASSWORD or prompted without echo"
+        ),
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("health", help="read aggregate health")
     subparsers.add_parser("measurement", help="read the latest impedance result")
@@ -177,6 +188,17 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
     client = Client(args.endpoint, timeout=args.timeout)
+    password = os.environ.get("GIZMO_OPCUA_CLIENT_PASSWORD", "")
+    if password and not args.username:
+        raise SystemExit(
+            "GIZMO_OPCUA_CLIENT_PASSWORD requires --username or "
+            "GIZMO_OPCUA_CLIENT_USERNAME"
+        )
+    if args.username:
+        if not password:
+            password = getpass.getpass("OPC UA password: ")
+        client.set_user(args.username)
+        client.set_password(password)
     client.connect()
     try:
         namespace = client.get_namespace_index(NAMESPACE_URI)
@@ -231,8 +253,11 @@ def main() -> None:
                 "variables": schema_rows(root),
             }
         elif args.command == "set-threshold":
-            if not 0 <= args.ohm <= 1_000_000:
-                raise SystemExit("threshold must be between 0 and 1000000")
+            if not THRESHOLD_MIN_OHM <= args.ohm <= THRESHOLD_MAX_OHM:
+                raise SystemExit(
+                    f"threshold must be between {THRESHOLD_MIN_OHM} "
+                    f"and {THRESHOLD_MAX_OHM}"
+                )
             node = canonical_node(client, namespace, "Configuration.ThresholdOhm")
             node.set_value(ua.Variant(args.ohm, ua.VariantType.UInt32))
             result = {"accepted_write": args.ohm, **data_value(node)}

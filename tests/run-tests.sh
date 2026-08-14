@@ -35,7 +35,8 @@ echo "ok   shell syntax"
 PYTHONPYCACHEPREFIX="$temporary/pycache" "$test_python" -m compileall -q \
     "$repo_root/src/python" "$repo_root/tests"
 PYTHONPYCACHEPREFIX="$temporary/pycache" "$test_python" -m py_compile \
-    "$repo_root/scripts/gizmo-opcua-client"
+    "$repo_root/scripts/gizmo-opcua-client" \
+    "$repo_root/tools/generate-opcua-contract.py"
 echo "ok   Python syntax"
 
 PYTHONPYCACHEPREFIX="$temporary/pycache" "$test_python" \

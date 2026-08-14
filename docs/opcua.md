@@ -10,11 +10,12 @@ OPC UA namespace:
 urn:fnal:gizmo
 ```
 
-It is served at `opc.tcp://<gizmo-address>:4840`. With the default
-configuration, UA service messages and `DataValue` instances use OPC UA Binary
-over UA TCP. OPC UA supplies the wire encoding, type identifiers, browsing,
-reads, writes, methods, subscriptions, status codes, and timestamps; no
-Protobuf schema or telemetry ports are required.
+The Kria serves it at `opc.tcp://<gizmo-address>:4840`. A conforming legacy
+ZedBoard serves the same baseline model on TCP 4842 at its separately assigned
+address. With the default configuration, UA service messages and `DataValue`
+instances use OPC UA Binary over UA TCP. OPC UA supplies the wire encoding,
+type identifiers, browsing, reads, writes, methods, subscriptions, status
+codes, and timestamps; no Protobuf schema or telemetry ports are required.
 
 Clients must resolve the namespace URI at connection time. They must not assume
 that its runtime namespace index is always `3`.
@@ -110,6 +111,11 @@ is retained with `UncertainLastUsableValue`. Before the first sample, values use
 
 Physical variables expose the standard OPC UA `EngineeringUnits` property.
 Descriptions are AddressSpace attributes and can be browsed by generic clients.
+The authoritative `Configuration.ThresholdOhm` contract is the unsigned-integer
+engineering range 0 through 1,000,000 ohms on both Kria and ZedBoard. The Kria
+implementation accepts that range. The ZedBoard conformance profile accepts
+only its hardware-supported 0 through 1023 ohm subset and returns
+`BadOutOfRange` above 1023 without narrowing the canonical metadata.
 
 `ResistanceOhm` is a physical value only when
 `ResistanceRange = InRange`. A raw result above the validated 500-ohm
@@ -158,6 +164,12 @@ gizmo-opcua-client capture-adc
 gizmo-opcua-client normalize-magnitude
 gizmo-opcua-client set-time 2026-07-27T09:15:00-06:00
 ```
+
+The legacy ZedBoard accepts only authenticated `set-threshold` writes. Select
+its site-configured TCP 4842 endpoint and pass the controlled deployment
+username with `--username`; the client prompts for its password without echo.
+Other legacy configuration writes and all legacy methods return an explicit
+non-good StatusCode.
 
 Generic OPC UA clients can browse or subscribe without this utility.
 
