@@ -36,7 +36,10 @@ from gizmo_model import (
     NetworkSnapshot,
     ServiceInventorySnapshot,
     StorageSnapshot,
+    SYSTEMD_UNITS,
     SystemCollectors,
+    THRESHOLD_MAX_OHM,
+    THRESHOLD_MIN_OHM,
     ThermalSnapshot,
     TimeSnapshot,
     parse_legacy_measurement,
@@ -72,6 +75,22 @@ _UNIT_IDS = {
     "byte": 8,
     "Mbit/s": 9,
 }
+
+# These objects are the stable, minimum inventory in the public OPC UA
+# contract. Runtime discovery may add further interfaces or filesystems, but
+# every conforming GIZMo producer exposes this baseline.
+CONTRACT_NETWORK_INTERFACES = ("lo", "eth0", "eth1")
+CONTRACT_FILESYSTEMS = ("Root", "Run", "State")
+
+
+def configured_threshold() -> int:
+    value = read_exported_int("setThreshold.env", "threshold", 100)
+    if not THRESHOLD_MIN_OHM <= value <= THRESHOLD_MAX_OHM:
+        raise ValueError(
+            f"stored threshold must be between {THRESHOLD_MIN_OHM} "
+            f"and {THRESHOLD_MAX_OHM}"
+        )
+    return value
 
 
 class GizmoOpcUaServer:
@@ -127,7 +146,7 @@ class GizmoOpcUaServer:
         self._build_canonical_model()
         self._mark_initial_values()
 
-        threshold = read_exported_int("setThreshold.env", "threshold", 100)
+        threshold = configured_threshold()
         run_interval = read_exported_int("setRunInterval.env", "runInterval", 100)
         self._last_threshold = threshold
         self._last_run_interval = run_interval
@@ -244,18 +263,35 @@ class GizmoOpcUaServer:
         path: str,
         name: str,
         callback: Callable[..., object],
-        inputs: list[object],
+        inputs: list[ua.Argument],
         description: str,
     ) -> object:
+        output = self._method_argument(
+            "Result",
+            ua.VariantType.String,
+            "Human-readable operation result.",
+        )
         node = parent.add_method(
             self._node_id(path),
             self._browse_name(name),
             callback,
             inputs,
-            [ua.VariantType.String],
+            [output],
         )
         self._set_description(node, description)
         return node
+
+    @staticmethod
+    def _method_argument(
+        name: str, variant_type: ua.VariantType, description: str
+    ) -> ua.Argument:
+        argument = ua.Argument()
+        argument.Name = name
+        argument.DataType = ua.NodeId(variant_type.value, 0)
+        argument.ValueRank = ua.ValueRank.Scalar
+        argument.ArrayDimensions = []
+        argument.Description = ua.LocalizedText(description)
+        return argument
 
     def _build_legacy_model(self) -> None:
         command = self.server.get_objects_node().add_object(
@@ -268,7 +304,7 @@ class GizmoOpcUaServer:
             [ua.VariantType.String],
             [ua.VariantType.String],
         )
-        threshold = read_exported_int("setThreshold.env", "threshold", 100)
+        threshold = configured_threshold()
         run_interval = read_exported_int("setRunInterval.env", "runInterval", 100)
         self.legacy_threshold = command.add_variable(
             self.legacy_namespace, "set_th", threshold
@@ -341,7 +377,7 @@ class GizmoOpcUaServer:
                 "Identity.ProductName",
                 "ProductName",
                 "GIZMo Kria",
-                "Ground Impedance Monitor using the AMD Kria platform.",
+                "Instrument product and hardware platform name.",
             ),
             (
                 "Identity.ModelNamespaceUri",
@@ -438,7 +474,8 @@ class GizmoOpcUaServer:
                 "Equivalent resistive impedance at the stimulus frequency. "
                 "This value is available only when ResistanceRange is "
                 "InRange. Above the validated presentation range, the result "
-                "is NaN with BadOutOfRange and the panel displays HIGH Z."
+                "is NaN with Good status and ResistanceRange=OutOfRange: "
+                "HIGH Z is a valid measurement state, not a quality fault."
             ),
             unit="Ohm",
         )
@@ -475,7 +512,7 @@ class GizmoOpcUaServer:
             ua.VariantType.Double,
             "Alarm threshold active in the measurement engine.",
             unit="Ohm",
-            value_range=(0.0, 1_000_000.0),
+            value_range=(float(THRESHOLD_MIN_OHM), float(THRESHOLD_MAX_OHM)),
         )
         self._add_point(
             measurement,
@@ -954,6 +991,8 @@ class GizmoOpcUaServer:
             "Interfaces",
             "One object per Linux network interface.",
         )
+        for interface in CONTRACT_NETWORK_INTERFACES:
+            self._ensure_interface_points(interface)
         self._add_point(
             network,
             "Network.ExpectedInterfaces",
@@ -1008,13 +1047,15 @@ class GizmoOpcUaServer:
             "Filesystems",
             "One object per relevant mounted filesystem.",
         )
+        for filesystem in CONTRACT_FILESYSTEMS:
+            self._ensure_filesystem_points(filesystem)
         self._add_quality_points(storage, "Storage")
 
         firmware = self._add_object(
             root,
             "Firmware",
             "Firmware",
-            "Runtime, Kria board, FPGA overlay, and expected-device state.",
+            "Runtime, compute platform, FPGA image, and expected-device state.",
         )
         for path, name, default, variant_type, description in (
             (
@@ -1085,7 +1126,7 @@ class GizmoOpcUaServer:
                 "ShellName",
                 "",
                 ua.VariantType.String,
-                "Kria shell type reported by shell.json.",
+                "FPGA platform shell type when reported by the runtime image.",
             ),
             (
                 "Firmware.ExpectedDevices",
@@ -1180,20 +1221,7 @@ class GizmoOpcUaServer:
             "Units",
             "One object per GIZMo systemd unit.",
         )
-        for unit in (
-            "gizmo.target",
-            "gizmo-network.service",
-            "gizmo-hardware.service",
-            "gizmo-control.socket",
-            "gizmo-control.service",
-            "gizmo-zmon.service",
-            "gizmo-display.service",
-            "gizmo-temperature.service",
-            "gizmo-sdr.service",
-            "gizmo-zmq.service",
-            "gizmo-opcua.service",
-            "gizmo-dashboard.service",
-        ):
+        for unit in SYSTEMD_UNITS:
             self._ensure_service_points(unit)
         self._add_quality_points(services, "Services")
 
@@ -1342,7 +1370,7 @@ class GizmoOpcUaServer:
             "Configuration",
             "Validated operator configuration forwarded to the measurement engine.",
         )
-        threshold = read_exported_int("setThreshold.env", "threshold", 100)
+        threshold = configured_threshold()
         interval = read_exported_int("setRunInterval.env", "runInterval", 100)
         self.configuration_threshold = self._add_point(
             configuration,
@@ -1352,7 +1380,7 @@ class GizmoOpcUaServer:
             ua.VariantType.UInt32,
             "Writable integer alarm threshold from 0 through 1,000,000 ohm.",
             unit="Ohm",
-            value_range=(0.0, 1_000_000.0),
+            value_range=(float(THRESHOLD_MIN_OHM), float(THRESHOLD_MAX_OHM)),
             writable=True,
         )
         self.configuration_interval = self._add_point(
@@ -1392,7 +1420,13 @@ class GizmoOpcUaServer:
             "Operations.StartCalibration",
             "StartCalibration",
             self.start_calibration_method,
-            [ua.VariantType.UInt32],
+            [
+                self._method_argument(
+                    "ReadsPerPoint",
+                    ua.VariantType.UInt32,
+                    "Requested measurements at each calibration point.",
+                )
+            ],
             "Restart ZMon in calibration mode with the requested reads per point.",
         )
         self._add_method(
@@ -1416,7 +1450,13 @@ class GizmoOpcUaServer:
             "Operations.SetSystemTime",
             "SetSystemTime",
             self.set_system_time_method,
-            [ua.VariantType.DateTime],
+            [
+                self._method_argument(
+                    "RequestedTime",
+                    ua.VariantType.DateTime,
+                    "Absolute UTC time requested for the Linux clock.",
+                )
+            ],
             "Set the Linux wall clock from an absolute OPC UA DateTime.",
         )
 
@@ -2001,10 +2041,13 @@ class GizmoOpcUaServer:
         self._update("Measurement.Sequence", snapshot.sequence, snapshot.quality, stamp)
         self._update("Measurement.SampleTime", stamp, snapshot.quality, stamp)
         resistance_quality = (
-            QUALITY_NOT_AVAILABLE if snapshot.resistance_ohm is None else QUALITY_GOOD
+            QUALITY_GOOD
+            if snapshot.resistance_range == RANGE_OUT_OF_RANGE
+            or snapshot.resistance_ohm is not None
+            else QUALITY_NOT_AVAILABLE
         )
         resistance_status = (
-            ua.StatusCodes.BadOutOfRange
+            ua.StatusCodes.Good
             if snapshot.resistance_range == RANGE_OUT_OF_RANGE
             else None
         )
@@ -2506,10 +2549,13 @@ class GizmoOpcUaServer:
             self._last_threshold,
         )
         if requested_threshold != self._last_threshold:
-            if not 0 <= requested_threshold <= 1_000_000:
+            if not THRESHOLD_MIN_OHM <= requested_threshold <= THRESHOLD_MAX_OHM:
                 self.configuration_threshold.set_value(self._last_threshold)
                 self.legacy_threshold.set_value(self._last_threshold)
-                raise ValueError("threshold must be between 0 and 1000000")
+                raise ValueError(
+                    f"threshold must be between {THRESHOLD_MIN_OHM} "
+                    f"and {THRESHOLD_MAX_OHM}"
+                )
             try:
                 result = self.request(f"set_th {requested_threshold}")
             except (OSError, RuntimeError, zmq.ZMQError):

@@ -42,6 +42,10 @@ PYTHONPYCACHEPREFIX="$temporary/pycache" "$test_python" \
     "$repo_root/tests/test_publication_safety.py"
 echo "ok   public-tree safety checks"
 
+PYTHONPYCACHEPREFIX="$temporary/pycache" "$test_python" \
+    "$repo_root/tests/test_opcua_contract.py"
+echo "ok   checked-in OPC UA contract integrity"
+
 PYTHONPYCACHEPREFIX="$temporary/pycache" "$test_python" "$repo_root/tests/test_zmq_commands.py"
 echo "ok   command compatibility tests"
 
@@ -58,6 +62,9 @@ PYTHONPYCACHEPREFIX="$temporary/pycache" "$test_python" \
 echo "ok   persistent historian tests"
 
 if "$test_python" -c 'import numpy, opcua, zmq' >/dev/null 2>&1; then
+    PYTHONPYCACHEPREFIX="$temporary/pycache" "$test_python" \
+        "$repo_root/tools/generate-opcua-contract.py" --check
+    echo "ok   generated OPC UA contract freshness"
     PYTHONPYCACHEPREFIX="$temporary/pycache" "$test_python" \
         "$repo_root/tests/test_opcua_address_space.py"
     echo "ok   OPC UA address-space integration tests"

@@ -16,6 +16,7 @@ import time
 import zmq
 
 from gizmo_common import CONTROL_SOCKET, atomic_write, read_exported_int, state_path
+from gizmo_model import THRESHOLD_MAX_OHM, THRESHOLD_MIN_OHM
 
 
 ZMQ_ENDPOINT = os.environ.get("GIZMO_ZMQ_ENDPOINT", "tcp://*:5555")
@@ -59,14 +60,20 @@ def restart_zmon(*arguments: str) -> str:
     return request_control("restart-zmon")
 
 
-def parse_integer(message: str, command: str, *, allow_zero: bool) -> int:
+def parse_integer(
+    message: str,
+    command: str,
+    *,
+    allow_zero: bool,
+    maximum: int = 1_000_000,
+) -> int:
     parts = message.split()
     if len(parts) != 2 or parts[0] != command or not parts[1].isdigit():
         raise ValueError(f"Invalid format. Use '{command} N' where N is a number.")
     value = int(parts[1])
     minimum = 0 if allow_zero else 1
-    if value < minimum or value > 1_000_000:
-        raise ValueError(f"{command} must be between {minimum} and 1000000.")
+    if value < minimum or value > maximum:
+        raise ValueError(f"{command} must be between {minimum} and {maximum}.")
     return value
 
 
@@ -80,6 +87,11 @@ def read_text_file(name: str) -> str:
 def handle_message(message: str) -> str:
     run_interval = read_exported_int("setRunInterval.env", "runInterval", 100)
     threshold = read_exported_int("setThreshold.env", "threshold", 100)
+    if not THRESHOLD_MIN_OHM <= threshold <= THRESHOLD_MAX_OHM:
+        raise RuntimeError(
+            f"stored threshold must be between {THRESHOLD_MIN_OHM} "
+            f"and {THRESHOLD_MAX_OHM}"
+        )
 
     if message.startswith("run "):
         interval = parse_integer(message, "run", allow_zero=False)
@@ -97,7 +109,12 @@ def handle_message(message: str) -> str:
         return f"Data from C-server: {get_zmon_data()}"
 
     if message.startswith("set_th "):
-        new_threshold = parse_integer(message, "set_th", allow_zero=True)
+        new_threshold = parse_integer(
+            message,
+            "set_th",
+            allow_zero=THRESHOLD_MIN_OHM == 0,
+            maximum=THRESHOLD_MAX_OHM,
+        )
         atomic_write(state_path("setThreshold.env"), f"export threshold={new_threshold}\n")
         result = restart_zmon(f"set_th {new_threshold}", f"run {run_interval}")
         return f"Threshold updated to {new_threshold}; {result}."

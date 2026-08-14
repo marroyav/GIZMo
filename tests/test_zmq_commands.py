@@ -81,6 +81,14 @@ class CommandTests(unittest.TestCase):
         )
         request.assert_called_once_with("restart-zmon")
 
+    def test_threshold_range_is_the_authoritative_kria_contract(self) -> None:
+        with self.assertRaises(ValueError):
+            gizmo_zmq.handle_message("set_th 1000001")
+        self.assertEqual(
+            (self.state_dir / "setThreshold.env").read_text(encoding="utf-8"),
+            "export threshold=100\n",
+        )
+
     def test_clear_latch_is_atomic_and_compatible(self) -> None:
         reply = gizmo_zmq.handle_message("clear_latch")
         self.assertIn("Cleared", reply)

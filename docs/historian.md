@@ -66,11 +66,12 @@ An out-of-range resistance is stored as:
 
 ```text
 value = NULL
-status = BadOutOfRange
+status = Good
 range = OutOfRange
 ```
 
-The database never stores 500 Ω as a measurement. The browser derives its
+`HIGH Z` is a valid good-quality range state, not a source or measurement
+failure. The database never stores 500 Ω as a measurement. The browser derives its
 chartreuse line at the validated 500 Ω boundary from the separate range state.
 CSV exports retain the empty resistance, status code, range, and range status.
 

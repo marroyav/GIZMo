@@ -12,7 +12,9 @@ persistent historian, and web-dashboard components. Systemd owns startup
 ordering, privileges, restarts, logs, and shutdown. Operators still start and
 stop the product as one unit.
 
-> Status: runtime 0.4.5 is the maintained package. It adds an explicit
+> Status: runtime 0.4.6 is the maintained package. It publishes model 1.3.1
+> as a deterministic, machine-readable Kria OPC UA contract for Slow Controls.
+> Runtime 0.4.5 added an explicit
 > unlimited-retention policy for permanent off-board replicas while keeping
 > the Kria historian as a bounded 14-day edge buffer. Runtime 0.4.4 added
 > cursor-based recovery to independent replicas and package-owned boot-time
@@ -90,8 +92,9 @@ ARM64 wheel hashes are pinned in
 `packaging/wheelhouse-arm64.sha256` and checked before an offline package
 build.
 
-The supported monitoring and control contract is the typed OPC UA namespace
-`urn:fnal:gizmo` on TCP 4840. It exposes measurement quality and source
+The Kria implementation is the authority for the GIZMo--Slow Controls
+contract: the typed OPC UA namespace `urn:fnal:gizmo`, normally served on TCP
+4840. It exposes measurement quality and source
 timestamps along with OS, network, firmware, time, service, calibration, and
 SDR status:
 
@@ -102,9 +105,20 @@ gizmo-opcua-client snapshot
 gizmo-opcua-client schema
 ```
 
+The generated [machine-readable contract](schema/gizmo-opcua-contract.json)
+pins its NodeIds, datatypes, access levels, units, ranges, methods, and digest.
 See [the OPC UA contract](docs/opcua.md). The recovered
 `SimpleOPCUAServer/CommandObject` namespace and text ZeroMQ API remain as
 compatibility interfaces during migration.
+
+The separately deployed ZedBoard server is a conforming producer, not a
+second contract authority or a proxy for the Kria. Its public implementation
+profile is maintained in
+[`marroyav/gizmo-zedboard-legacy`](https://github.com/marroyav/gizmo-zedboard-legacy).
+It keeps the canonical nodes and metadata even where that hardware has a
+narrower capability; in particular, its accepted threshold-write subset is
+0--1023 ohm while the authoritative contract range remains 0--1,000,000 ohm.
+Slow Controls connects to the two endpoints independently.
 
 The generic off-board replica design is described in the
 [off-board monitoring guide](docs/offboard-monitoring.md). The reusable
@@ -152,7 +166,7 @@ Read [the migration procedure](docs/migration.md) before touching a running
 legacy image. The safe high-level sequence is:
 
 ```sh
-sudo dpkg -i build/gizmo-runtime_0.4.5_arm64.deb
+sudo dpkg -i build/gizmo-runtime_0.4.6_arm64.deb
 sudo gizmo-doctor
 ```
 
@@ -178,6 +192,8 @@ Calibration state is retained even when the package is purged.
 - `config/`: publication-safe examples and non-site runtime policy
 - `packaging/`: systemd, udev, sysusers, tmpfiles, and `.deb` construction
 - `deploy/`: parameterized off-board monitoring and time-relay examples
+- `schema/`: generated, digest-pinned OPC UA contract consumed by clients and
+  conforming implementations
 - `docs/`: source-level architecture, operation, and security guidance
 
 The public history does not contain the recovered live-root snapshot, compiled

@@ -26,7 +26,7 @@ os.environ["GIZMO_OPCUA_ALLOW_INSECURE"] = "1"
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src" / "python"))
 
-from gizmo_model import parse_legacy_measurement
+from gizmo_model import THRESHOLD_MAX_OHM, parse_legacy_measurement
 from gizmo_opcua import GizmoOpcUaServer
 from opcua import Client, ua
 
@@ -46,8 +46,9 @@ class AddressSpaceTests(unittest.TestCase):
             averages_per_calculation=100,
             sampled_at=dt.datetime.now(dt.timezone.utc),
         )
+        cls.baseline_measurement = (record, snapshot)
         cls.server = GizmoOpcUaServer()
-        cls.server._apply_measurement((record, snapshot))
+        cls.server._apply_measurement(cls.baseline_measurement)
         cls.server.server.start()
         cls.client = Client(ENDPOINT)
         cls.client.connect()
@@ -95,7 +96,7 @@ class AddressSpaceTests(unittest.TestCase):
         )
         self.assertEqual(
             self.node("Identity.ModelVersion").get_value(),
-            "1.3.0",
+            "1.3.1",
         )
 
     def test_legacy_command_object_is_preserved(self) -> None:
@@ -114,11 +115,37 @@ class AddressSpaceTests(unittest.TestCase):
 
         self.assertTrue(value.startswith("Data from C-server:"))
 
-    def test_descriptions_do_not_publish_the_internal_sentinel_as_ohms(self) -> None:
+    def test_descriptions_define_high_z_as_a_good_range_state(self) -> None:
         description = self.node("Measurement.ResistanceOhm").get_description()
 
-        self.assertIn("BadOutOfRange", description.Text)
+        self.assertIn("Good status", description.Text)
+        self.assertIn("valid measurement state", description.Text)
         self.assertNotIn("1050", description.Text)
+
+    def test_high_z_is_non_numeric_but_good_quality(self) -> None:
+        record = (
+            "Res=1050,Cap=0,Th=100,Mag=1,Phase=0,Phase2=0,"
+            "PhaseRX=0,I=1,Q=0,Alarm=0,AlarmReason=,"
+            "latched=0,LatchStamp="
+        )
+        snapshot = parse_legacy_measurement(
+            record,
+            sequence=8,
+            averages_per_calculation=100,
+            sampled_at=dt.datetime.now(dt.timezone.utc),
+        )
+        try:
+            self.server._apply_measurement((record, snapshot))
+
+            resistance = self.node("Measurement.ResistanceOhm").get_data_value()
+            range_value = self.node("Measurement.ResistanceRange").get_data_value()
+            quality = self.node("Measurement.Quality").get_value()
+            self.assertTrue(resistance.StatusCode.is_good())
+            self.assertTrue(range_value.StatusCode.is_good())
+            self.assertEqual(range_value.Value.Value, "OutOfRange")
+            self.assertEqual(quality, "Good")
+        finally:
+            self.server._apply_measurement(self.baseline_measurement)
 
     def test_dashboard_service_is_part_of_owned_runtime_inventory(self) -> None:
         variant_type = self.node(
@@ -141,6 +168,14 @@ class AddressSpaceTests(unittest.TestCase):
         request.assert_called_once_with("set_th 200")
         self.assertEqual(threshold.get_value(), 200)
         self.assertEqual(self.server.legacy_threshold.get_value(), 200)
+
+    def test_kria_contract_retains_full_threshold_range(self) -> None:
+        threshold = self.node("Configuration.ThresholdOhm")
+        engineering_range = threshold.get_child(["0:EURange"]).get_value()
+
+        self.assertEqual(THRESHOLD_MAX_OHM, 1_000_000)
+        self.assertEqual(engineering_range.Low, 0.0)
+        self.assertEqual(engineering_range.High, 1_000_000.0)
 
     def test_clear_latch_is_an_explicit_method(self) -> None:
         operations = self.node("Operations")

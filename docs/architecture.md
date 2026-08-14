@@ -43,9 +43,12 @@ Unix socket only when History mode or historical CSV is requested. A historian
 failure therefore cannot break the live path. See the
 [historian design](historian.md).
 
-The typed `urn:fnal:gizmo` OPC UA namespace is the sole supported public
-machine contract. The recovered text and `SimpleOPCUAServer` interfaces are
-migration adapters.
+The Kria implementation of the typed `urn:fnal:gizmo` OPC UA namespace is the
+sole authoritative GIZMo--Slow Controls machine contract. The recovered text
+and `SimpleOPCUAServer` interfaces are migration adapters. A ZedBoard server
+may implement the same contract at its own endpoint, but remains an independent
+producer: it neither proxies nor controls this Kria runtime, and its narrower
+hardware capabilities do not redefine the canonical model.
 
 ## Privilege separation
 

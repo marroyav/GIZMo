@@ -1,8 +1,10 @@
 # GIZMo OPC UA contract
 
-## Contract and transport
+## Authority, conformance, and transport
 
-The supported public machine interface is the OPC UA namespace:
+The Kria OPC UA implementation in this repository is the authoritative
+GIZMo--Slow Controls contract. The supported public machine interface is the
+OPC UA namespace:
 
 ```text
 urn:fnal:gizmo
@@ -16,6 +18,30 @@ Protobuf schema or telemetry ports are required.
 
 Clients must resolve the namespace URI at connection time. They must not assume
 that its runtime namespace index is always `3`.
+
+The generated `schema/gizmo-opcua-contract.json` is the reviewable,
+machine-readable form of that Kria model. It contains the required baseline
+objects, variables, methods, NodeIds, datatypes, access levels, engineering
+metadata, and a canonical SHA-256 digest. Regenerate it after an intentional
+model change with:
+
+```sh
+python3 tools/generate-opcua-contract.py
+```
+
+The ZedBoard OPC UA server consumes and conforms to this contract at a separate
+endpoint. It does not define a parallel model, connect to or proxy the Kria,
+or start, stop, configure, or otherwise control the Kria implementation. Slow
+Controls therefore configures two independent OPC UA connections and uses
+device/application identity to distinguish the producers.
+
+A platform limitation never changes a canonical NodeId, datatype, unit,
+range, or meaning. A conforming producer keeps required nodes and reports an
+appropriate non-good status where it cannot supply a value. Unsupported
+methods return `BadNotSupported`. The ZedBoard currently accepts threshold
+writes only from 0 through 1023 ohm and returns `BadOutOfRange` above that
+implementation limit; the authoritative Kria engineering range remains
+0 through 1,000,000 ohm.
 
 The model version is available at the stable string NodeId:
 
@@ -42,7 +68,7 @@ The canonical object is `Objects/GIZMo`, with the following subtrees:
 | `OperatingSystem` | OS/kernel, CPU, load, memory, processes, entropy, file handles |
 | `Network` | interfaces, addresses, routes, counters, and MAC provenance |
 | `Storage` | capacity and health of relevant filesystems |
-| `Firmware` | runtime, Kria identity, FPGA overlay, hashes, and expected devices |
+| `Firmware` | runtime, compute-platform identity, FPGA image, hashes, and expected devices |
 | `Services` | state, PID, restarts, and result for every owned systemd unit |
 | `Calibration` | configuration and metadata/digests for all calibration tables |
 | `SDR` | stream state and the latest complete signed `Int32` frame |
@@ -76,8 +102,9 @@ A client read or subscription receives a `DataValue` containing:
 - the source timestamp.
 
 Unknown values are not silently represented as plausible numeric zero.
-Unavailable floating-point values carry a non-good status and `NaN`; unavailable
-times carry a non-good status. After a source disconnects, an existing sample
+Unavailable floating-point values normally carry a non-good status and `NaN`;
+unavailable times carry a non-good status. The deliberate exception is the
+valid `HIGH Z` range state described below. After a source disconnects, an existing sample
 is retained with `UncertainLastUsableValue`. Before the first sample, values use
 `BadWaitingForInitialData`.
 
@@ -88,9 +115,10 @@ Descriptions are AddressSpace attributes and can be browsed by generic clients.
 `ResistanceRange = InRange`. A raw result above the validated 500-ohm
 presentation range, or the recovered calculation's non-numeric sentinel,
 produces `ResistanceRange = OutOfRange`; `ResistanceOhm` is `NaN` with
-`BadOutOfRange`. The packaged client renders that `NaN` as JSON `null`, and
-the front panel displays `HIGH Z`. No precise numeric resistance should be
-inferred in this state. The dashboard represents it as an explicitly clipped
+`Good` status. `HIGH Z` is a valid, good-quality measurement state. The
+packaged client renders that `NaN` as JSON `null`, and the front panel displays
+`HIGH Z`. No precise numeric resistance should be inferred in this state. The
+dashboard represents it as an explicitly clipped
 `>500 Ω` trace at the validated-range boundary; that display coordinate is not
 written back into `ResistanceOhm`.
 

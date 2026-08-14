@@ -76,6 +76,8 @@ install: full
 	install -d -m 0755 $(DESTDIR)$(PREFIX)/libexec/gizmo
 	install -m 0644 src/python/*.py $(DESTDIR)$(PREFIX)/libexec/gizmo/
 	install -D -m 0644 VERSION $(DESTDIR)$(PREFIX)/share/gizmo/VERSION
+	install -D -m 0644 schema/gizmo-opcua-contract.json \
+		$(DESTDIR)$(PREFIX)/share/gizmo/schema/gizmo-opcua-contract.json
 	install -d -m 0755 $(DESTDIR)$(PREFIX)/share/gizmo/dashboard
 	install -m 0644 web/dashboard/* $(DESTDIR)$(PREFIX)/share/gizmo/dashboard/
 	install -d -m 0755 $(DESTDIR)/etc/gizmo

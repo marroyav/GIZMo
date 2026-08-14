@@ -112,8 +112,8 @@ Other chartable scalars can be selected from the variable explorer.
 When `Measurement.ResistanceRange = OutOfRange`, the impedance plot adds a
 chartreuse `HIGH Z (>500 Ω)` trace at the 500 Ω validated-range boundary.
 This is a clipped visual state, not a fabricated 500 Ω measurement:
-`ResistanceOhm` remains unavailable with `BadOutOfRange`, and the impedance
-CSV exports the canonical range and its status code rather than replacing the
+`ResistanceOhm` remains non-numeric with `Good` status because `HIGH Z` is a
+valid range state, and the impedance CSV exports the canonical range and its status code rather than replacing the
 missing resistance value with 500.
 
 ## Read-only HTTP interface

@@ -64,7 +64,7 @@ class MeasurementModelTests(unittest.TestCase):
 
         self.assertIsNone(result.resistance_ohm)
         self.assertEqual(result.resistance_range, RANGE_OUT_OF_RANGE)
-        self.assertEqual(result.quality, QUALITY_UNCERTAIN)
+        self.assertEqual(result.quality, QUALITY_GOOD)
         self.assertIn("non-numeric out-of-range sentinel", result.diagnostic)
 
     def test_high_z_boundary_is_not_published_as_numeric_resistance(self) -> None:
@@ -89,6 +89,7 @@ class MeasurementModelTests(unittest.TestCase):
 
         self.assertIsNone(high.resistance_ohm)
         self.assertEqual(high.resistance_range, RANGE_OUT_OF_RANGE)
+        self.assertEqual(high.quality, QUALITY_GOOD)
         self.assertIn("validated 500 ohm", high.diagnostic)
         self.assertEqual(boundary.resistance_ohm, 500.0)
         self.assertEqual(boundary.resistance_range, RANGE_IN_RANGE)

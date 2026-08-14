@@ -59,15 +59,11 @@ def fake_snapshot(second: int, *, high_z: bool = False) -> dict[str, object]:
     values["Measurement.ResistanceOhm"]["value"] = (
         None if high_z else 200.0 + second
     )
-    values["Measurement.ResistanceOhm"]["status"] = (
-        "BadOutOfRange" if high_z else "Good"
-    )
+    values["Measurement.ResistanceOhm"]["status"] = "Good"
     values["Measurement.ResistanceRange"]["value"] = (
         "OutOfRange" if high_z else "InRange"
     )
-    values["Measurement.ResistanceRange"]["status"] = (
-        "UncertainLastUsableValue"
-    )
+    values["Measurement.ResistanceRange"]["status"] = "Good"
     return {
         "sequence": second,
         "generated_at": source,
@@ -121,7 +117,7 @@ class HistorianTests(unittest.TestCase):
         )
         self.assertEqual(
             decoded["Measurement.ResistanceOhm"]["status"],
-            "BadOutOfRange",
+            "Good",
         )
         self.assertEqual(
             historian.iso_from_us(

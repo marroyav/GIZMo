@@ -26,8 +26,10 @@ from gizmo_common import read_exported_int, state_path
 
 MODEL_NAMESPACE_URI = "urn:fnal:gizmo"
 LEGACY_NAMESPACE_URI = "SimpleOPCUAServer"
-MODEL_VERSION = "1.3.0"
-MODEL_PUBLICATION_DATE = dt.datetime(2026, 7, 27, tzinfo=dt.timezone.utc)
+MODEL_VERSION = "1.3.1"
+MODEL_PUBLICATION_DATE = dt.datetime(2026, 8, 14, tzinfo=dt.timezone.utc)
+THRESHOLD_MIN_OHM = 0
+THRESHOLD_MAX_OHM = 1_000_000
 
 QUALITY_GOOD = "Good"
 QUALITY_UNCERTAIN = "Uncertain"
@@ -472,18 +474,16 @@ def parse_legacy_measurement(
         # implementation detail as a physical resistance or lower bound.
         result.resistance_ohm = None
         result.resistance_range = RANGE_OUT_OF_RANGE
-        result.quality = QUALITY_UNCERTAIN
         result.diagnostic = (
-            "ZMon reported its non-numeric out-of-range sentinel; "
-            "ResistanceOhm is unavailable"
+            "HIGH Z: ZMon reported its non-numeric out-of-range sentinel; "
+            "ResistanceOhm has no finite value"
         )
     elif result.resistance_ohm > valid_max_ohm:
         result.resistance_ohm = None
         result.resistance_range = RANGE_OUT_OF_RANGE
-        result.quality = QUALITY_UNCERTAIN
         result.diagnostic = (
-            f"resistance exceeds the validated {valid_max_ohm:g} ohm "
-            "presentation range; ResistanceOhm is unavailable"
+            f"HIGH Z: resistance exceeds the validated {valid_max_ohm:g} ohm "
+            "presentation range; ResistanceOhm has no finite value"
         )
     else:
         result.resistance_range = RANGE_IN_RANGE

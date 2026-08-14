@@ -34,6 +34,10 @@ class PublicationSafetyTests(unittest.TestCase):
         ):
             self.assertFalse((ROOT / relative).exists(), relative)
 
+    def test_public_contract_is_present(self) -> None:
+        self.assertTrue((ROOT / "schema/gizmo-opcua-contract.json").is_file())
+        self.assertTrue((ROOT / "tools/generate-opcua-contract.py").is_file())
+
     def test_no_controlled_binary_types_are_tracked(self) -> None:
         forbidden = {".bin", ".dtbo", ".img", ".sqlite", ".sqlite3", ".db"}
         found = [
