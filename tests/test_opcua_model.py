@@ -145,7 +145,7 @@ class MeasurementModelTests(unittest.TestCase):
 
 class InventoryModelTests(unittest.TestCase):
     def test_mac_provenance_only_claims_fru_when_verified(self) -> None:
-        mac = "02:00:00:00:00:01"
+        mac = "00:11:22:33:44:55"
 
         self.assertEqual(
             SystemCollectors._mac_source(mac, "", 0, []),
@@ -165,14 +165,14 @@ class InventoryModelTests(unittest.TestCase):
             "FRU Board Manufacturer: XILINX\n"
             "FRU Board Product Name: SCK-KR-G\n"
             "FRU Board Serial Number: ABC123\n"
-            "FRU OEM MAC ID 0: 02:00:00:00:00:01\n"
+            "FRU OEM MAC ID 0: 00:11:22:33:44:55\n"
             "FRU Error: multirecord area checksum invalid\n"
         )
 
         self.assertEqual(values["manufacturer"], "XILINX")
         self.assertEqual(values["product_name"], "SCK-KR-G")
         self.assertEqual(values["serial_number"], "ABC123")
-        self.assertEqual(macs, ["02:00:00:00:00:01"])
+        self.assertEqual(macs, ["00:11:22:33:44:55"])
 
     def test_active_overlay_requires_a_nonnegative_active_slot(self) -> None:
         output = (

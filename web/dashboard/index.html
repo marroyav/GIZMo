@@ -23,6 +23,7 @@
     <nav class="section-nav" aria-label="Dashboard sections">
       <a href="#overview">Overview</a>
       <a href="#trends">Trends</a>
+      <a href="#calibration">Calibration</a>
       <a href="#systems">Systems</a>
       <a href="#variables">Data</a>
     </nav>
@@ -168,6 +169,12 @@
               <input id="history-to" type="datetime-local" step="1">
             </label>
           </div>
+          <div class="zoom-controls" aria-label="Synchronized telemetry zoom">
+            <output id="telemetry-zoom-state" class="zoom-state">Full range</output>
+            <button id="zoom-in-button" class="button button-secondary" type="button">Zoom in</button>
+            <button id="zoom-out-button" class="button button-secondary" type="button">Zoom out</button>
+            <button id="zoom-reset-button" class="button button-secondary" type="button" disabled>Reset zoom</button>
+          </div>
           <button id="pause-button" class="button button-secondary" type="button">Pause plot</button>
           <button id="export-button" class="button button-primary" type="button">Export all CSV</button>
         </div>
@@ -180,7 +187,67 @@
       ></div>
       <div class="trend-footer">
         <p id="plot-state" class="plot-state">Live · retaining up to one hour in this browser</p>
-        <p class="sync-note">Shared time range · synchronized cursors</p>
+        <p class="sync-note">Wheel to zoom · drag a zoomed plot to pan · double-click to reset</p>
+      </div>
+    </section>
+
+    <section id="calibration" class="card calibration-card" aria-labelledby="calibration-title">
+      <div class="calibration-heading">
+        <div>
+          <p class="eyebrow">Installed resistance calibration</p>
+          <h2 id="calibration-title">Response versus impedance z</h2>
+          <p class="section-copy">Live board table · lock-in magnitude, sinusoidal RMS estimate, and atan2 phase</p>
+        </div>
+        <div class="calibration-actions" aria-label="Calibration plot zoom">
+          <output id="calibration-zoom-state" class="zoom-state">Full range</output>
+          <button id="calibration-zoom-in" class="button button-secondary" type="button">Zoom in</button>
+          <button id="calibration-zoom-out" class="button button-secondary" type="button">Zoom out</button>
+          <button id="calibration-zoom-reset" class="button button-secondary" type="button" disabled>Reset zoom</button>
+        </div>
+      </div>
+
+      <dl class="calibration-summary" aria-live="polite">
+        <div>
+          <dt>Calibration points</dt>
+          <dd id="calibration-point-count">—</dd>
+        </div>
+        <div>
+          <dt>Validated z span</dt>
+          <dd id="calibration-z-range">—</dd>
+        </div>
+        <div>
+          <dt>Peak RMS estimate</dt>
+          <dd id="calibration-rms-peak">—</dd>
+        </div>
+        <div>
+          <dt>Open-circuit anchor</dt>
+          <dd id="calibration-open-anchor">—</dd>
+        </div>
+      </dl>
+
+      <div id="calibration-plot-shell" class="calibration-plot-shell">
+        <canvas
+          id="calibration-canvas"
+          class="calibration-canvas"
+          role="img"
+          aria-label="Resistance calibration magnitude, RMS estimate, and phase versus impedance"
+          title="Wheel to zoom; drag after zooming to pan; double-click to reset."
+        ></canvas>
+        <div id="calibration-empty" class="chart-empty">
+          <span class="empty-wave" aria-hidden="true"></span>
+          <strong id="calibration-empty-title">Loading calibration</strong>
+          <span id="calibration-empty-copy">Reading the installed table over OPC UA.</span>
+        </div>
+        <div id="calibration-tooltip" class="chart-tooltip calibration-tooltip" hidden></div>
+      </div>
+      <div class="calibration-footer">
+        <div class="calibration-legend" aria-label="Calibration plot legend">
+          <span><i class="legend-swatch calibration-magnitude"></i>Lock-in magnitude</span>
+          <span><i class="legend-swatch calibration-rms"></i>Sine RMS estimate</span>
+          <span><i class="legend-swatch calibration-phase"></i>Atan2 phase</span>
+        </div>
+        <p id="calibration-state" class="plot-state">Waiting for the installed table</p>
+        <p class="calibration-note">RMS estimate = lock-in magnitude / √2 · ADC-count units</p>
       </div>
     </section>
 

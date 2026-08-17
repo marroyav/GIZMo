@@ -22,9 +22,24 @@ fi
 if [ -d /run/systemd/system ]; then
     systemctl daemon-reload
     systemctl enable --now systemd-timesyncd.service >/dev/null 2>&1 || true
+    # Releases before 0.5.0 stopped the complete target in prerm.  Honor that
+    # old marker once when crossing the boundary, then use the narrower path
+    # for subsequent upgrades.
     if [ -e /run/gizmo/restart-after-upgrade ]; then
         rm -f /run/gizmo/restart-after-upgrade
         systemctl start gizmo.target
+    elif [ -e /run/gizmo/restart-services-after-upgrade ]; then
+        rm -f /run/gizmo/restart-services-after-upgrade
+        systemctl try-restart \
+            gizmo-control.service \
+            gizmo-zmon.service \
+            gizmo-display.service \
+            gizmo-temperature.service \
+            gizmo-sdr.service \
+            gizmo-zmq.service \
+            gizmo-opcua.service \
+            gizmo-historian.service \
+            gizmo-dashboard.service
     fi
 fi
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import json
 import math
 import os
 import re
@@ -12,13 +13,16 @@ import signal
 import socket
 import threading
 import time
+import uuid
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import zmq
 from gizmo_common import atomic_write, notify_systemd, read_exported_int, state_path
+from gizmo_security import CredentialStore, secure_file_mode
 from gizmo_model import (
     LEGACY_NAMESPACE_URI,
     MODEL_NAMESPACE_URI,
@@ -48,6 +52,8 @@ from gizmo_model import (
     utc_now,
 )
 from opcua import Server, ua
+from opcua.server.internal_server import InternalServer, InternalSession
+from opcua.server.user_manager import UserManager
 
 ENDPOINT = os.environ.get("GIZMO_OPCUA_ENDPOINT", "opc.tcp://0.0.0.0:4840")
 APPLICATION_URI = os.environ.get("GIZMO_OPCUA_APPLICATION_URI", "urn:fnal:gizmo:server")
@@ -74,13 +80,96 @@ _UNIT_IDS = {
     "s": 7,
     "byte": 8,
     "Mbit/s": 9,
+    "A": 10,
 }
 
 # These objects are the stable, minimum inventory in the public OPC UA
 # contract. Runtime discovery may add further interfaces or filesystems, but
-# every conforming GIZMo producer exposes this baseline.
+# both supported GIZMo implementations always expose this baseline.
 CONTRACT_NETWORK_INTERFACES = ("lo", "eth0", "eth1")
 CONTRACT_FILESYSTEMS = ("Root", "Run", "State")
+
+COMMAND_GATE_MODES = frozenset({"disabled", "operator", "maintenance"})
+COMMAND_STATES = frozenset(
+    {"Idle", "Accepted", "Running", "Succeeded", "Failed", "Rejected", "TimedOut"}
+)
+MAINTENANCE_METHODS = frozenset(
+    {
+        "Operations.StartCalibration",
+        "Operations.CaptureAdc",
+        "Operations.NormalizeMagnitude",
+        "Operations.SetSystemTime",
+        "Operations.RestartMeasurementEngine",
+        "Operations.AbortCalibration",
+        "Operations.RestoreNormalState",
+    }
+)
+CANONICAL_METHODS = frozenset({"Operations.ClearLatch", *MAINTENANCE_METHODS})
+CANONICAL_WRITES = {
+    "Configuration.ThresholdOhm": "ThresholdOhm",
+    "Configuration.AveragesPerCalculation": "AveragesPerCalculation",
+}
+COMMAND_RESULT_LIMIT = 512
+COMMAND_PARAMETER_LIMIT = 256
+COMMAND_REQUESTER_LIMIT = 128
+ZMON_BINARY = Path(os.environ.get("GIZMO_ZMON_BINARY", "/usr/bin/gizmo-zmon"))
+
+
+@dataclass
+class ActiveCommand:
+    """One serialized mutation awaiting dispatch or readback verification."""
+
+    command_id: str
+    name: str
+    requester: str
+    role: str
+    parameters: str
+    requested_at: dt.datetime
+    deadline_monotonic: float
+    verification: str = "dispatching"
+    start_sequence: int = 0
+    start_pid: int = 0
+    expected_hash: str = ""
+    expected_value: object | None = None
+    terminal_calibration_state: str = ""
+    accepted_result: str = ""
+    restore_attempted: bool = False
+
+
+class GizmoInternalSession(InternalSession):
+    """Pinned python-opcua session with a real mutation authorization hook.
+
+    python-opcua 0.98.13 checks variable access bits but does not pass the
+    session identity to Method callbacks.  This session subclass keeps reads
+    unchanged and routes remote Writes/Calls through the GIZMo policy before
+    the library touches the address space.  The package pins that dependency,
+    and integration tests exercise this boundary.
+    """
+
+    gizmo_requester = "anonymous"
+    gizmo_role = "anonymous"
+
+    def write(self, params: object) -> list[ua.StatusCode]:
+        if self.user == UserManager.User.Admin:
+            return super().write(params)
+        owner = getattr(self.iserver, "gizmo_owner", None)
+        if owner is None:
+            return [
+                ua.StatusCode(ua.StatusCodes.BadOutOfService)
+                for _ in params.NodesToWrite
+            ]
+        return owner._remote_write(self, params)
+
+    def call(self, params: object) -> list[ua.CallMethodResult]:
+        if self.user == UserManager.User.Admin:
+            return super().call(params)
+        owner = getattr(self.iserver, "gizmo_owner", None)
+        if owner is None:
+            return [
+                GizmoOpcUaServer._call_error(ua.StatusCodes.BadOutOfService)
+                for _ in params
+            ]
+        return owner._remote_call(self, params)
 
 
 def configured_threshold() -> int:
@@ -99,6 +188,8 @@ class GizmoOpcUaServer:
     def __init__(self) -> None:
         self._context = zmq.Context.instance()
         self._request_lock = threading.Lock()
+        self._command_lock = threading.RLock()
+        self._command_context = threading.local()
         self._executor = ThreadPoolExecutor(
             max_workers=8, thread_name_prefix="gizmo-opcua"
         )
@@ -116,12 +207,53 @@ class GizmoOpcUaServer:
         self._measurement_sequence = 0
         self._sdr_sequence = 0
         self._adc_ready_at: float | None = None
+        self._active_command: ActiveCommand | None = None
+        self._last_good_measurement_sequence = 0
+        self._last_good_measurement_at: dt.datetime | None = None
+        self._last_measurement_snapshot: MeasurementSnapshot | None = None
+        self._zmon_pid = 0
+        self._latest_time_snapshot: TimeSnapshot | None = None
+        self._command_fault_locked = False
+        self._command_state_path = Path(
+            os.environ.get(
+                "GIZMO_OPCUA_COMMAND_STATE_FILE",
+                str(state_path("opcua-command-state.json")),
+            )
+        )
+        self._configured_gate_mode = os.environ.get(
+            "GIZMO_OPCUA_COMMAND_GATE", "disabled"
+        ).strip().lower()
+        self._command_policy_reason = ""
+        if self._configured_gate_mode not in COMMAND_GATE_MODES:
+            self._command_policy_reason = (
+                f"invalid GIZMO_OPCUA_COMMAND_GATE={self._configured_gate_mode!r}"
+            )
+            self._configured_gate_mode = "disabled"
+        self._credential_path = Path(
+            os.environ.get(
+                "GIZMO_OPCUA_CREDENTIAL_FILE", "/etc/gizmo/opcua-users"
+            )
+        )
+        try:
+            if self._credential_path.exists() and not secure_file_mode(
+                self._credential_path
+            ):
+                raise RuntimeError(
+                    "credential file must not be a symlink or world-accessible"
+                )
+            self._credentials = CredentialStore.load(self._credential_path)
+        except RuntimeError as error:
+            self._credentials = CredentialStore()
+            self._command_policy_reason = str(error)
+        self._effective_gate_mode = "disabled"
         self._running = True
         self._ready_sent = False
         self._last_notified_health = ""
         self._started_at = utc_now()
 
-        self.server = Server()
+        internal_server = InternalServer(session_cls=GizmoInternalSession)
+        self.server = Server(iserver=internal_server)
+        self.server.iserver.gizmo_owner = self
         self.server.set_endpoint(ENDPOINT)
         self.server.set_server_name("Fermilab GIZMo OPC UA Server")
         self.server.set_application_uri(APPLICATION_URI)
@@ -145,6 +277,7 @@ class GizmoOpcUaServer:
         self._build_legacy_model()
         self._build_canonical_model()
         self._mark_initial_values()
+        self._restore_command_state()
 
         threshold = configured_threshold()
         run_interval = read_exported_int("setRunInterval.env", "runInterval", 100)
@@ -157,6 +290,10 @@ class GizmoOpcUaServer:
         private_key = os.environ.get("GIZMO_OPCUA_PRIVATE_KEY", "").strip()
         allow_insecure = (
             os.environ.get("GIZMO_OPCUA_ALLOW_INSECURE", "0").strip() == "1"
+        )
+        allow_insecure_credentials = (
+            os.environ.get("GIZMO_OPCUA_ALLOW_INSECURE_CREDENTIALS", "0").strip()
+            == "1"
         )
         if bool(certificate) != bool(private_key):
             raise RuntimeError(
@@ -180,7 +317,46 @@ class GizmoOpcUaServer:
         if allow_insecure:
             policies.append(ua.SecurityPolicyType.NoSecurity)
         self.server.set_security_policy(policies)
-        self.server.set_security_IDs(["Anonymous"])
+        self.server.user_manager.set_user_manager(self._authenticate_user)
+        self.server.allow_remote_admin(False)
+        identities = ["Anonymous"]
+        if self._credentials:
+            identities.append("Username")
+        self.server.set_security_IDs(identities)
+
+        secure_only = bool(certificate and private_key and not allow_insecure)
+        credential_transport_accepted = secure_only or allow_insecure_credentials
+        if self._configured_gate_mode == "disabled":
+            self._effective_gate_mode = "disabled"
+            self._command_policy_reason = (
+                self._command_policy_reason or "command gate is disabled by configuration"
+            )
+        elif not self._credentials:
+            self._effective_gate_mode = "disabled"
+            self._command_policy_reason = (
+                self._command_policy_reason
+                or f"no valid credentials in {self._credential_path}"
+            )
+        elif not credential_transport_accepted:
+            self._effective_gate_mode = "disabled"
+            self._command_policy_reason = (
+                "username commands require secure-only OPC UA transport or "
+                "an explicit isolated-network insecure-credential exception"
+            )
+        else:
+            self._effective_gate_mode = self._configured_gate_mode
+            self._command_policy_reason = ""
+
+    def _authenticate_user(
+        self, session: GizmoInternalSession, username: str, password: str
+    ) -> bool:
+        role = self._credentials.authenticate(str(username), str(password))
+        if role is None:
+            return False
+        session.user = UserManager.User.User
+        session.gizmo_requester = self._bounded(str(username), COMMAND_REQUESTER_LIMIT)
+        session.gizmo_role = role
+        return True
 
     @staticmethod
     def _safe_identifier(value: str) -> str:
@@ -522,6 +698,20 @@ class GizmoOpcUaServer:
             ua.VariantType.Double,
             "Nominal sine-wave stimulus frequency.",
             unit="Hz",
+        )
+        self._add_point(
+            measurement,
+            "Measurement.StimulusCurrentRmsAmpere",
+            "StimulusCurrentRmsAmpere",
+            math.nan,
+            ua.VariantType.Double,
+            (
+                "RMS AC stimulus current delivered to the detector-ground "
+                "measurement path. The node remains BadNotSupported/NaN until "
+                "the monitor-point transfer function, bandwidth, RMS conversion, "
+                "and uncertainty are validated."
+            ),
+            unit="A",
         )
         for path, name, description, unit in (
             (
@@ -1272,6 +1462,44 @@ class GizmoOpcUaServer:
                 "Newest modification time among the calibration tables.",
                 None,
             ),
+            (
+                "Calibration.OperationState",
+                "OperationState",
+                "Idle",
+                ua.VariantType.String,
+                (
+                    "Calibration execution state: Idle, Starting, Running, "
+                    "Restoring, Completed, Failed, Aborted, or Unknown."
+                ),
+                None,
+            ),
+            (
+                "Calibration.LastOperationTime",
+                "LastOperationTime",
+                _MISSING_DATETIME,
+                ua.VariantType.DateTime,
+                "Completion, failure, or abort time of the latest calibration operation.",
+                None,
+            ),
+            (
+                "Calibration.LastOperationResult",
+                "LastOperationResult",
+                "",
+                ua.VariantType.String,
+                "Bounded result or validation summary for the latest calibration operation.",
+                None,
+            ),
+            (
+                "Calibration.RestorationState",
+                "RestorationState",
+                "NotRequired",
+                ua.VariantType.String,
+                (
+                    "Normal-state restoration: NotRequired, Commanded, "
+                    "Verified, Failed, or Unknown."
+                ),
+                None,
+            ),
         ):
             self._add_point(
                 calibration,
@@ -1282,6 +1510,19 @@ class GizmoOpcUaServer:
                 description,
                 unit=unit,
             )
+        self._add_point(
+            calibration,
+            "Calibration.ProgressPercent",
+            "ProgressPercent",
+            math.nan,
+            ua.VariantType.Double,
+            (
+                "Best available calibration progress estimate. Unknown progress "
+                "is NaN with a non-good StatusCode."
+            ),
+            unit="%",
+            value_range=(0.0, 100.0),
+        )
         tables_object = self._add_object(
             calibration,
             "Calibration.Tables",
@@ -1407,6 +1648,85 @@ class GizmoOpcUaServer:
             "Operations",
             "Explicit operations replacing legacy magic writable variables.",
         )
+        for path, name, default, variant_type, description in (
+            (
+                "Operations.CommandGateState",
+                "CommandGateState",
+                "Disabled",
+                ua.VariantType.String,
+                (
+                    "Mutating-command gate: Disabled, Ready, Busy, "
+                    "MaintenanceLocked, or FaultLocked."
+                ),
+            ),
+            (
+                "Operations.LastCommandId",
+                "LastCommandId",
+                "",
+                ua.VariantType.String,
+                "Opaque identifier for the latest accepted or rejected mutation.",
+            ),
+            (
+                "Operations.LastCommandName",
+                "LastCommandName",
+                "",
+                ua.VariantType.String,
+                "Canonical name of the latest accepted or rejected mutation.",
+            ),
+            (
+                "Operations.LastCommandParameters",
+                "LastCommandParameters",
+                "",
+                ua.VariantType.String,
+                "Bounded, sanitized parameters for the latest mutation.",
+            ),
+            (
+                "Operations.LastCommandRequester",
+                "LastCommandRequester",
+                "",
+                ua.VariantType.String,
+                "Authenticated user or service identity for the latest mutation.",
+            ),
+            (
+                "Operations.LastCommandState",
+                "LastCommandState",
+                "Idle",
+                ua.VariantType.String,
+                (
+                    "Execution state: Idle, Accepted, Running, Succeeded, "
+                    "Failed, Rejected, or TimedOut."
+                ),
+            ),
+            (
+                "Operations.LastCommandRequestTime",
+                "LastCommandRequestTime",
+                _MISSING_DATETIME,
+                ua.VariantType.DateTime,
+                "UTC time the latest mutating request was received.",
+            ),
+            (
+                "Operations.LastCommandCompletionTime",
+                "LastCommandCompletionTime",
+                _MISSING_DATETIME,
+                ua.VariantType.DateTime,
+                "UTC time the latest mutating request reached a terminal state.",
+            ),
+            (
+                "Operations.LastCommandResult",
+                "LastCommandResult",
+                "",
+                ua.VariantType.String,
+                "Bounded result or failure reason for the latest mutation.",
+            ),
+        ):
+            self._add_point(
+                operations,
+                path,
+                name,
+                default,
+                variant_type,
+                description,
+            )
         self._add_method(
             operations,
             "Operations.ClearLatch",
@@ -1458,6 +1778,33 @@ class GizmoOpcUaServer:
                 )
             ],
             "Set the Linux wall clock from an absolute OPC UA DateTime.",
+        )
+        self._add_method(
+            operations,
+            "Operations.RestartMeasurementEngine",
+            "RestartMeasurementEngine",
+            self.restart_measurement_engine_method,
+            [],
+            (
+                "Restart only the ZMon measurement engine and verify a new PID, "
+                "the expected executable hash, and a fresh measurement."
+            ),
+        )
+        self._add_method(
+            operations,
+            "Operations.AbortCalibration",
+            "AbortCalibration",
+            self.abort_calibration_method,
+            [],
+            "Abort an active calibration and begin verified normal-state restoration.",
+        )
+        self._add_method(
+            operations,
+            "Operations.RestoreNormalState",
+            "RestoreNormalState",
+            self.restore_normal_state_method,
+            [],
+            "Command and verify the approved normal measurement state.",
         )
 
         health = self._add_object(
@@ -1933,9 +2280,583 @@ class GizmoOpcUaServer:
     def _method_value(value: object) -> object:
         return getattr(value, "Value", value)
 
+    @staticmethod
+    def _bounded(value: object, limit: int) -> str:
+        text = re.sub(r"[\x00-\x1f\x7f]+", " ", str(value)).strip()
+        return text if len(text) <= limit else f"{text[: limit - 3]}..."
+
+    @staticmethod
+    def _call_error(status_code: int) -> ua.CallMethodResult:
+        result = ua.CallMethodResult()
+        result.StatusCode = ua.StatusCode(status_code)
+        return result
+
+    @staticmethod
+    def _parse_persisted_time(value: object) -> dt.datetime | None:
+        if not isinstance(value, str) or not value:
+            return None
+        try:
+            parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return None
+        return parsed.astimezone(dt.timezone.utc)
+
+    def _base_gate_state(self) -> str:
+        if self._command_fault_locked:
+            return "FaultLocked"
+        if self._active_command is not None:
+            return "Busy"
+        if self._effective_gate_mode == "disabled":
+            return "Disabled"
+        if self._effective_gate_mode == "operator":
+            return "MaintenanceLocked"
+        return "Ready"
+
+    def _publish_gate_state(self) -> None:
+        self._update(
+            "Operations.CommandGateState",
+            self._base_gate_state(),
+            QUALITY_GOOD,
+            utc_now(),
+        )
+
+    def _publish_audit(self) -> None:
+        stamp = utc_now()
+        for path, value in (
+            ("Operations.LastCommandId", self._audit["id"]),
+            ("Operations.LastCommandName", self._audit["name"]),
+            ("Operations.LastCommandParameters", self._audit["parameters"]),
+            ("Operations.LastCommandRequester", self._audit["requester"]),
+            ("Operations.LastCommandState", self._audit["state"]),
+            ("Operations.LastCommandResult", self._audit["result"]),
+        ):
+            self._update(path, value, QUALITY_GOOD, stamp)
+        request_time = self._audit.get("request_time")
+        completion_time = self._audit.get("completion_time")
+        self._update(
+            "Operations.LastCommandRequestTime",
+            request_time,
+            QUALITY_GOOD if request_time else QUALITY_NOT_AVAILABLE,
+            stamp,
+            status_code=(None if request_time else ua.StatusCodes.BadNoData),
+        )
+        self._update(
+            "Operations.LastCommandCompletionTime",
+            completion_time,
+            QUALITY_GOOD if completion_time else QUALITY_NOT_AVAILABLE,
+            stamp,
+            status_code=(None if completion_time else ua.StatusCodes.BadNoData),
+        )
+
+    def _publish_calibration_operation(self) -> None:
+        stamp = utc_now()
+        for path, value in (
+            ("Calibration.OperationState", self._calibration_operation["state"]),
+            (
+                "Calibration.LastOperationResult",
+                self._calibration_operation["result"],
+            ),
+            (
+                "Calibration.RestorationState",
+                self._calibration_operation["restoration"],
+            ),
+        ):
+            self._update(path, value, QUALITY_GOOD, stamp)
+        progress = self._calibration_operation.get("progress")
+        self._update(
+            "Calibration.ProgressPercent",
+            progress,
+            QUALITY_GOOD if progress is not None else QUALITY_NOT_AVAILABLE,
+            stamp,
+            status_code=(
+                None if progress is not None else ua.StatusCodes.BadDataUnavailable
+            ),
+        )
+        completed = self._calibration_operation.get("time")
+        self._update(
+            "Calibration.LastOperationTime",
+            completed,
+            QUALITY_GOOD if completed else QUALITY_NOT_AVAILABLE,
+            stamp,
+            status_code=(None if completed else ua.StatusCodes.BadNoData),
+        )
+
+    def _persist_command_state(self) -> None:
+        payload = {
+            "schema": 1,
+            "fault_locked": self._command_fault_locked,
+            "audit": {
+                **self._audit,
+                "request_time": (
+                    self._audit["request_time"].isoformat()
+                    if self._audit.get("request_time")
+                    else None
+                ),
+                "completion_time": (
+                    self._audit["completion_time"].isoformat()
+                    if self._audit.get("completion_time")
+                    else None
+                ),
+            },
+            "calibration": {
+                **self._calibration_operation,
+                "time": (
+                    self._calibration_operation["time"].isoformat()
+                    if self._calibration_operation.get("time")
+                    else None
+                ),
+            },
+        }
+        try:
+            atomic_write(
+                self._command_state_path,
+                json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+            )
+        except OSError as error:
+            print(f"Unable to persist OPC UA command state: {error}", flush=True)
+
+    def _restore_command_state(self) -> None:
+        self._audit = {
+            "id": "",
+            "name": "",
+            "parameters": "",
+            "requester": "",
+            "state": "Idle",
+            "request_time": None,
+            "completion_time": None,
+            "result": "",
+        }
+        self._calibration_operation = {
+            "state": "Idle",
+            "progress": None,
+            "time": None,
+            "result": "",
+            "restoration": "NotRequired",
+        }
+        try:
+            raw = json.loads(self._command_state_path.read_text(encoding="utf-8"))
+            if raw.get("schema") != 1:
+                raise ValueError("unsupported command-state schema")
+            audit = raw.get("audit", {})
+            calibration = raw.get("calibration", {})
+            state = str(audit.get("state", "Idle"))
+            if state not in COMMAND_STATES:
+                raise ValueError("invalid persisted command state")
+            self._audit.update(
+                {
+                    "id": self._bounded(audit.get("id", ""), 64),
+                    "name": self._bounded(audit.get("name", ""), 96),
+                    "parameters": self._bounded(
+                        audit.get("parameters", ""), COMMAND_PARAMETER_LIMIT
+                    ),
+                    "requester": self._bounded(
+                        audit.get("requester", ""), COMMAND_REQUESTER_LIMIT
+                    ),
+                    "state": state,
+                    "request_time": self._parse_persisted_time(
+                        audit.get("request_time")
+                    ),
+                    "completion_time": self._parse_persisted_time(
+                        audit.get("completion_time")
+                    ),
+                    "result": self._bounded(
+                        audit.get("result", ""), COMMAND_RESULT_LIMIT
+                    ),
+                }
+            )
+            calibration_state = str(calibration.get("state", "Idle"))
+            restoration = str(calibration.get("restoration", "NotRequired"))
+            if calibration_state not in {
+                "Idle",
+                "Starting",
+                "Running",
+                "Restoring",
+                "Completed",
+                "Failed",
+                "Aborted",
+                "Unknown",
+            }:
+                raise ValueError("invalid persisted calibration state")
+            if restoration not in {
+                "NotRequired",
+                "Commanded",
+                "Verified",
+                "Failed",
+                "Unknown",
+            }:
+                raise ValueError("invalid persisted restoration state")
+            progress = calibration.get("progress")
+            if not isinstance(progress, (int, float)) or isinstance(progress, bool):
+                progress = None
+            elif not 0 <= float(progress) <= 100:
+                progress = None
+            self._calibration_operation.update(
+                {
+                    "state": calibration_state,
+                    "progress": float(progress) if progress is not None else None,
+                    "time": self._parse_persisted_time(calibration.get("time")),
+                    "result": self._bounded(
+                        calibration.get("result", ""), COMMAND_RESULT_LIMIT
+                    ),
+                    "restoration": restoration,
+                }
+            )
+            self._command_fault_locked = bool(raw.get("fault_locked", False))
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
+            self._command_fault_locked = True
+            self._audit["result"] = self._bounded(
+                f"Stored command state is invalid: {error}", COMMAND_RESULT_LIMIT
+            )
+
+        if self._audit["state"] in {"Accepted", "Running"}:
+            now = utc_now()
+            self._audit["state"] = "Failed"
+            self._audit["completion_time"] = now
+            self._audit["result"] = self._bounded(
+                "OPC UA server restarted before command completion; normal state requires verification",
+                COMMAND_RESULT_LIMIT,
+            )
+            self._calibration_operation.update(
+                {
+                    "state": "Unknown",
+                    "progress": None,
+                    "time": now,
+                    "result": "Command interrupted by OPC UA server restart",
+                    "restoration": "Unknown",
+                }
+            )
+            self._command_fault_locked = True
+            self._persist_command_state()
+
+        self._publish_audit()
+        self._publish_calibration_operation()
+        self._publish_gate_state()
+        self._update(
+            "Measurement.StimulusCurrentRmsAmpere",
+            None,
+            QUALITY_NOT_AVAILABLE,
+            utc_now(),
+            status_code=ua.StatusCodes.BadNotSupported,
+        )
+
+    def _set_calibration_operation(
+        self,
+        state: str,
+        *,
+        progress: float | None = None,
+        result: str | None = None,
+        restoration: str | None = None,
+        terminal: bool = False,
+    ) -> None:
+        self._calibration_operation["state"] = state
+        self._calibration_operation["progress"] = progress
+        if result is not None:
+            self._calibration_operation["result"] = self._bounded(
+                result, COMMAND_RESULT_LIMIT
+            )
+        if restoration is not None:
+            self._calibration_operation["restoration"] = restoration
+        if terminal:
+            self._calibration_operation["time"] = utc_now()
+        self._publish_calibration_operation()
+        self._persist_command_state()
+
+    def _record_rejected(
+        self, name: str, parameters: str, requester: str, reason: str
+    ) -> None:
+        if self._active_command is not None:
+            print(
+                f"Rejected concurrent OPC UA command {name} from {requester}: {reason}",
+                flush=True,
+            )
+            return
+        now = utc_now()
+        self._audit = {
+            "id": uuid.uuid4().hex,
+            "name": name,
+            "parameters": self._bounded(parameters, COMMAND_PARAMETER_LIMIT),
+            "requester": self._bounded(requester, COMMAND_REQUESTER_LIMIT),
+            "state": "Rejected",
+            "request_time": now,
+            "completion_time": now,
+            "result": self._bounded(reason, COMMAND_RESULT_LIMIT),
+        }
+        self._publish_audit()
+        self._publish_gate_state()
+        self._persist_command_state()
+
+    def _finish_command(
+        self,
+        command_id: str,
+        state: str,
+        result: str,
+        *,
+        fault_locked: bool = False,
+    ) -> None:
+        with self._command_lock:
+            if self._active_command is None or self._active_command.command_id != command_id:
+                return
+            if state not in {"Succeeded", "Failed", "TimedOut"}:
+                raise ValueError(f"invalid terminal command state {state}")
+            self._audit["state"] = state
+            self._audit["completion_time"] = utc_now()
+            self._audit["result"] = self._bounded(result, COMMAND_RESULT_LIMIT)
+            self._update(
+                "Configuration.LastCommandResult",
+                self._audit["result"],
+                QUALITY_GOOD if state == "Succeeded" else QUALITY_BAD,
+                self._audit["completion_time"],
+            )
+            self._active_command = None
+            if fault_locked:
+                self._command_fault_locked = True
+            self._publish_audit()
+            self._publish_gate_state()
+            self._persist_command_state()
+
+    def _set_command_running(
+        self,
+        command_id: str,
+        verification: str,
+        accepted_result: str,
+        *,
+        timeout_seconds: float,
+        expected_value: object | None = None,
+        terminal_calibration_state: str = "",
+    ) -> None:
+        with self._command_lock:
+            active = self._active_command
+            if active is None or active.command_id != command_id:
+                raise RuntimeError("command reservation was lost")
+            active.verification = verification
+            active.accepted_result = self._bounded(
+                accepted_result, COMMAND_RESULT_LIMIT
+            )
+            active.expected_value = expected_value
+            active.terminal_calibration_state = terminal_calibration_state
+            active.deadline_monotonic = time.monotonic() + max(1.0, timeout_seconds)
+            self._audit["state"] = "Running"
+            self._audit["result"] = active.accepted_result
+            self._publish_audit()
+            self._publish_gate_state()
+            self._persist_command_state()
+            self._next_run["Measurement"] = 0.0
+            self._next_run["Services"] = 0.0
+
+    @staticmethod
+    def _sha256_file(path: Path) -> str:
+        try:
+            digest = hashlib.sha256()
+            with path.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            return digest.hexdigest()
+        except OSError:
+            return ""
+
+    def _begin_remote_command(
+        self,
+        session: GizmoInternalSession,
+        path: str,
+        parameters: str,
+    ) -> tuple[ActiveCommand | None, int | None]:
+        requester = getattr(session, "gizmo_requester", "anonymous")
+        role = getattr(session, "gizmo_role", "anonymous")
+        name = path.rsplit(".", 1)[-1]
+        maintenance = path in MAINTENANCE_METHODS
+        with self._command_lock:
+            if role not in {"operator", "maintenance"}:
+                reason = "authenticated operator or maintenance role required"
+                self._record_rejected(name, parameters, requester, reason)
+                return None, ua.StatusCodes.BadUserAccessDenied
+            if self._effective_gate_mode == "disabled":
+                reason = self._command_policy_reason or "command gate is disabled"
+                self._record_rejected(name, parameters, requester, reason)
+                return None, ua.StatusCodes.BadOutOfService
+            if maintenance and role != "maintenance":
+                reason = "maintenance role required"
+                self._record_rejected(name, parameters, requester, reason)
+                return None, ua.StatusCodes.BadUserAccessDenied
+            if maintenance and self._effective_gate_mode != "maintenance":
+                reason = "maintenance command gate is locked"
+                self._record_rejected(name, parameters, requester, reason)
+                return None, ua.StatusCodes.BadInvalidState
+            if self._command_fault_locked and path != "Operations.RestoreNormalState":
+                reason = "command gate is fault-locked; RestoreNormalState is required"
+                self._record_rejected(name, parameters, requester, reason)
+                return None, ua.StatusCodes.BadInvalidState
+
+            if self._active_command is not None:
+                if path == "Operations.AbortCalibration" and self._active_command.verification in {
+                    "calibration",
+                    "calibration-timeout-restore",
+                }:
+                    previous = self._active_command
+                    self._finish_command(
+                        previous.command_id,
+                        "Failed",
+                        f"Superseded by AbortCalibration from {requester}",
+                    )
+                else:
+                    reason = "another mutating command is already running"
+                    self._record_rejected(name, parameters, requester, reason)
+                    return None, ua.StatusCodes.BadInvalidState
+
+            now = utc_now()
+            command = ActiveCommand(
+                command_id=uuid.uuid4().hex,
+                name=name,
+                requester=self._bounded(requester, COMMAND_REQUESTER_LIMIT),
+                role=role,
+                parameters=self._bounded(parameters, COMMAND_PARAMETER_LIMIT),
+                requested_at=now,
+                deadline_monotonic=time.monotonic()
+                + self._configured_timeout(
+                    "GIZMO_OPCUA_COMMAND_TIMEOUT_SECONDS", 60
+                ),
+                start_sequence=self._last_good_measurement_sequence,
+                start_pid=self._zmon_pid,
+                expected_hash=self._sha256_file(ZMON_BINARY),
+            )
+            self._active_command = command
+            self._audit = {
+                "id": command.command_id,
+                "name": command.name,
+                "parameters": command.parameters,
+                "requester": command.requester,
+                "state": "Accepted",
+                "request_time": now,
+                "completion_time": None,
+                "result": "Accepted; awaiting dispatch",
+            }
+            self._publish_audit()
+            self._publish_gate_state()
+            self._persist_command_state()
+            return command, None
+
+    def _method_parameters(self, path: str, arguments: list[object]) -> str:
+        values = [self._method_value(item) for item in arguments]
+        if path == "Operations.StartCalibration" and values:
+            payload: dict[str, object] = {"reads_per_point": int(values[0])}
+        elif path == "Operations.SetSystemTime" and values:
+            value = values[0]
+            payload = {
+                "requested_time": (
+                    value.isoformat() if isinstance(value, dt.datetime) else str(value)
+                )
+            }
+        else:
+            payload = {}
+        return self._bounded(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")),
+            COMMAND_PARAMETER_LIMIT,
+        )
+
+    def _remote_call(
+        self, session: GizmoInternalSession, params: object
+    ) -> list[ua.CallMethodResult]:
+        results: list[ua.CallMethodResult] = []
+        for request in params:
+            identifier = getattr(request.MethodId, "Identifier", "")
+            path = (
+                identifier.removeprefix("GIZMo.")
+                if isinstance(identifier, str) and identifier.startswith("GIZMo.")
+                else ""
+            )
+            if path not in CANONICAL_METHODS:
+                results.append(self._call_error(ua.StatusCodes.BadUserAccessDenied))
+                continue
+            try:
+                parameters = self._method_parameters(path, list(request.InputArguments))
+            except (TypeError, ValueError):
+                parameters = "{}"
+            command, status = self._begin_remote_command(session, path, parameters)
+            if command is None:
+                results.append(self._call_error(status or ua.StatusCodes.BadInvalidState))
+                continue
+            self._command_context.command_id = command.command_id
+            try:
+                result = self.server.iserver.method_service.call([request])[0]
+            finally:
+                self._command_context.command_id = ""
+            if not result.StatusCode.is_good():
+                self._finish_command(
+                    command.command_id,
+                    "Failed",
+                    f"Method dispatch failed: {result.StatusCode}",
+                )
+            results.append(result)
+        return results
+
+    def _remote_write(
+        self, session: GizmoInternalSession, params: object
+    ) -> list[ua.StatusCode]:
+        writes = list(params.NodesToWrite)
+        if len(writes) != 1:
+            return [
+                ua.StatusCode(ua.StatusCodes.BadTooManyOperations) for _ in writes
+            ]
+        request = writes[0]
+        identifier = getattr(request.NodeId, "Identifier", "")
+        path = (
+            identifier.removeprefix("GIZMo.")
+            if isinstance(identifier, str) and identifier.startswith("GIZMo.")
+            else ""
+        )
+        if path not in CANONICAL_WRITES:
+            return [ua.StatusCode(ua.StatusCodes.BadUserAccessDenied)]
+        requested = request.Value.Value.Value
+        parameters = self._bounded(
+            json.dumps({"value": requested}, sort_keys=True, separators=(",", ":")),
+            COMMAND_PARAMETER_LIMIT,
+        )
+        command, status = self._begin_remote_command(session, path, parameters)
+        if command is None:
+            return [ua.StatusCode(status or ua.StatusCodes.BadInvalidState)]
+        result = self.server.iserver.attribute_service.write(params, session.user)
+        if not result[0].is_good():
+            self._finish_command(
+                command.command_id,
+                "Failed",
+                f"OPC UA write failed: {result[0]}",
+            )
+            return result
+        command.verification = "pending-write"
+        command.expected_value = requested
+        return result
+
+    def _current_command(self) -> ActiveCommand:
+        command_id = getattr(self._command_context, "command_id", "")
+        active = self._active_command
+        if active is None or active.command_id != command_id:
+            raise RuntimeError("mutating method requires an authorized OPC UA session")
+        return active
+
+    @staticmethod
+    def _configured_timeout(name: str, default: float) -> float:
+        try:
+            value = float(os.environ.get(name, str(default)))
+        except ValueError:
+            value = default
+        return min(max(value, 1.0), 86_400.0)
+
+    @staticmethod
+    def _require_accepted_reply(reply: str) -> str:
+        text = reply.strip()
+        if not text or text.lower().startswith(("command failed", "unknown command")):
+            raise RuntimeError(text or "empty command response")
+        return text
+
     def _command_result(self, result: str) -> list[ua.Variant]:
-        self._update("Configuration.LastCommandResult", result, QUALITY_GOOD, utc_now())
-        return [ua.Variant(result, ua.VariantType.String)]
+        bounded = self._bounded(result, COMMAND_RESULT_LIMIT)
+        self._update(
+            "Configuration.LastCommandResult", bounded, QUALITY_GOOD, utc_now()
+        )
+        return [ua.Variant(bounded, ua.VariantType.String)]
 
     def send_legacy_command(self, parent: object, command: object) -> list[ua.Variant]:
         del parent
@@ -1944,43 +2865,269 @@ class GizmoOpcUaServer:
 
     def clear_latch_method(self, parent: object) -> list[ua.Variant]:
         del parent
-        return self._command_result(self.request("clear_latch"))
+        command = self._current_command()
+        try:
+            reply = self._require_accepted_reply(self.request("clear_latch"))
+            accepted = f"Accepted: {reply}; awaiting fresh alarm readback"
+            self._set_command_running(
+                command.command_id,
+                "clear-latch",
+                accepted,
+                timeout_seconds=self._configured_timeout(
+                    "GIZMO_OPCUA_COMMAND_TIMEOUT_SECONDS", 60
+                ),
+            )
+            return self._command_result(accepted)
+        except Exception as error:
+            self._finish_command(
+                command.command_id, "Failed", f"ClearLatch failed: {error}"
+            )
+            raise
 
     def start_calibration_method(
         self, parent: object, reads_per_point: object
     ) -> list[ua.Variant]:
         del parent
+        command = self._current_command()
         reads = int(self._method_value(reads_per_point))
         if reads < 1 or reads > 1_000_000:
+            self._finish_command(
+                command.command_id,
+                "Failed",
+                "reads_per_point must be between 1 and 1000000",
+            )
             raise ValueError("reads_per_point must be between 1 and 1000000")
-        return self._command_result(self.request(f"CAL {reads}"))
+        self._set_calibration_operation(
+            "Starting",
+            progress=None,
+            result=f"Calibration requested with {reads} reads per point",
+            restoration="Unknown",
+        )
+        try:
+            reply = self._require_accepted_reply(self.request(f"CAL {reads}"))
+            accepted = f"Accepted: {reply}; calibration progress is not observable"
+            self._set_calibration_operation(
+                "Running",
+                progress=None,
+                result=accepted,
+                restoration="Unknown",
+            )
+            self._set_command_running(
+                command.command_id,
+                "calibration",
+                accepted,
+                timeout_seconds=self._configured_timeout(
+                    "GIZMO_OPCUA_CALIBRATION_TIMEOUT_SECONDS", 1800
+                ),
+                expected_value=reads,
+                terminal_calibration_state="Completed",
+            )
+            return self._command_result(accepted)
+        except Exception as error:
+            message = f"StartCalibration failed: {error}"
+            self._set_calibration_operation(
+                "Failed",
+                progress=None,
+                result=message,
+                restoration="Unknown",
+                terminal=True,
+            )
+            self._finish_command(command.command_id, "Failed", message)
+            raise
 
     def capture_adc_method(self, parent: object) -> list[ua.Variant]:
         del parent
-        result = self.request("read_adc")
-        self._adc_ready_at = time.monotonic() + 5
-        return self._command_result(result)
+        command = self._current_command()
+        try:
+            reply = self._require_accepted_reply(self.request("read_adc"))
+            self._adc_ready_at = time.monotonic() + 5
+            accepted = f"Accepted: {reply}; awaiting bounded ADC file and normal acquisition"
+            self._set_command_running(
+                command.command_id,
+                "capture-adc",
+                accepted,
+                timeout_seconds=self._configured_timeout(
+                    "GIZMO_OPCUA_COMMAND_TIMEOUT_SECONDS", 60
+                ),
+                expected_value=command.requested_at.timestamp(),
+            )
+            return self._command_result(accepted)
+        except Exception as error:
+            self._finish_command(
+                command.command_id, "Failed", f"CaptureAdc failed: {error}"
+            )
+            raise
 
     def normalize_magnitude_method(self, parent: object) -> list[ua.Variant]:
         del parent
-        atomic_write(state_path("normalizeMagFlag.env"), "normalizeMagFlag=1\n")
-        return self._command_result("Magnitude normalization requested")
+        command = self._current_command()
+        try:
+            path = state_path("normalizeMagFlag.env")
+            atomic_write(path, "normalizeMagFlag=1\n")
+            if read_exported_int(path.name, "normalizeMagFlag", 0) != 1:
+                raise RuntimeError("normalization request did not read back")
+            result = "Magnitude normalization requested and state-file write verified"
+            self._finish_command(command.command_id, "Succeeded", result)
+            self._next_run["Calibration"] = 0.0
+            return self._command_result(result)
+        except Exception as error:
+            self._finish_command(
+                command.command_id,
+                "Failed",
+                f"NormalizeMagnitude failed: {error}",
+            )
+            raise
 
     def set_system_time_method(
         self, parent: object, requested_time: object
     ) -> list[ua.Variant]:
         del parent
+        command = self._current_command()
         requested = self._method_value(requested_time)
         if not isinstance(requested, dt.datetime):
+            self._finish_command(
+                command.command_id,
+                "Failed",
+                "requested_time must be an OPC UA DateTime",
+            )
             raise ValueError("requested_time must be an OPC UA DateTime")
         if requested.tzinfo is None:
             requested = requested.replace(tzinfo=dt.timezone.utc)
         epoch_seconds = int(requested.timestamp())
         if epoch_seconds < 946_684_800 or epoch_seconds > 4_102_444_800:
+            self._finish_command(
+                command.command_id,
+                "Failed",
+                "requested_time must be between 2000 and 2100",
+            )
             raise ValueError("requested_time must be between 2000 and 2100")
-        result = self.request(f"set_time_epoch {epoch_seconds}")
-        self._next_run["Time"] = 0.0
-        return self._command_result(result)
+        try:
+            reply = self._require_accepted_reply(
+                self.request(f"set_time_epoch {epoch_seconds}")
+            )
+            accepted = f"Accepted: {reply}; awaiting clock and acquisition readback"
+            self._next_run["Time"] = 0.0
+            self._set_command_running(
+                command.command_id,
+                "set-time",
+                accepted,
+                timeout_seconds=self._configured_timeout(
+                    "GIZMO_OPCUA_COMMAND_TIMEOUT_SECONDS", 60
+                ),
+                expected_value=epoch_seconds,
+            )
+            return self._command_result(accepted)
+        except Exception as error:
+            self._finish_command(
+                command.command_id, "Failed", f"SetSystemTime failed: {error}"
+            )
+            raise
+
+    def restart_measurement_engine_method(
+        self, parent: object
+    ) -> list[ua.Variant]:
+        del parent
+        command = self._current_command()
+        try:
+            reply = self._require_accepted_reply(
+                self.request(f"run {self._last_run_interval}")
+            )
+            accepted = (
+                f"Accepted: {reply}; awaiting new PID, executable hash, "
+                "and fresh measurement"
+            )
+            self._set_command_running(
+                command.command_id,
+                "restart",
+                accepted,
+                timeout_seconds=self._configured_timeout(
+                    "GIZMO_OPCUA_COMMAND_TIMEOUT_SECONDS", 60
+                ),
+            )
+            return self._command_result(accepted)
+        except Exception as error:
+            self._finish_command(
+                command.command_id,
+                "Failed",
+                f"RestartMeasurementEngine failed: {error}",
+            )
+            raise
+
+    def abort_calibration_method(self, parent: object) -> list[ua.Variant]:
+        del parent
+        command = self._current_command()
+        self._set_calibration_operation(
+            "Restoring",
+            progress=None,
+            result="Calibration abort accepted; commanding normal acquisition",
+            restoration="Commanded",
+        )
+        try:
+            reply = self._require_accepted_reply(
+                self.request(f"run {self._last_run_interval}")
+            )
+            accepted = f"Accepted: {reply}; awaiting verified normal acquisition"
+            self._set_command_running(
+                command.command_id,
+                "restore",
+                accepted,
+                timeout_seconds=self._configured_timeout(
+                    "GIZMO_OPCUA_RESTORE_TIMEOUT_SECONDS", 90
+                ),
+                terminal_calibration_state="Aborted",
+            )
+            return self._command_result(accepted)
+        except Exception as error:
+            message = f"AbortCalibration restoration failed: {error}"
+            self._set_calibration_operation(
+                "Failed",
+                progress=None,
+                result=message,
+                restoration="Failed",
+                terminal=True,
+            )
+            self._finish_command(
+                command.command_id, "Failed", message, fault_locked=True
+            )
+            raise
+
+    def restore_normal_state_method(self, parent: object) -> list[ua.Variant]:
+        del parent
+        command = self._current_command()
+        self._set_calibration_operation(
+            "Restoring",
+            progress=None,
+            result="Normal acquisition requested",
+            restoration="Commanded",
+        )
+        try:
+            reply = self._require_accepted_reply(
+                self.request(f"run {self._last_run_interval}")
+            )
+            accepted = f"Accepted: {reply}; awaiting verified normal acquisition"
+            self._set_command_running(
+                command.command_id,
+                "restore",
+                accepted,
+                timeout_seconds=self._configured_timeout(
+                    "GIZMO_OPCUA_RESTORE_TIMEOUT_SECONDS", 90
+                ),
+                terminal_calibration_state="Idle",
+            )
+            return self._command_result(accepted)
+        except Exception as error:
+            message = f"RestoreNormalState failed: {error}"
+            self._set_calibration_operation(
+                "Failed",
+                progress=None,
+                result=message,
+                restoration="Failed",
+                terminal=True,
+            )
+            self._finish_command(
+                command.command_id, "Failed", message, fault_locked=True
+            )
+            raise
 
     @staticmethod
     def csv_as_text(name: str) -> str:
@@ -2037,6 +3184,10 @@ class GizmoOpcUaServer:
     def _apply_measurement(self, result: tuple[str, MeasurementSnapshot]) -> None:
         raw, snapshot = result
         stamp = snapshot.sampled_at
+        self._last_measurement_snapshot = snapshot
+        if snapshot.quality == QUALITY_GOOD:
+            self._last_good_measurement_sequence = snapshot.sequence
+            self._last_good_measurement_at = stamp
         self.legacy_data.set_value(raw)
         self._update("Measurement.Sequence", snapshot.sequence, snapshot.quality, stamp)
         self._update("Measurement.SampleTime", stamp, snapshot.quality, stamp)
@@ -2079,6 +3230,13 @@ class GizmoOpcUaServer:
             snapshot.capacitance_range,
             snapshot.quality,
             stamp,
+        )
+        self._update(
+            "Measurement.StimulusCurrentRmsAmpere",
+            None,
+            QUALITY_NOT_AVAILABLE,
+            stamp,
+            status_code=ua.StatusCodes.BadNotSupported,
         )
         for path, value in (
             ("Measurement.ThresholdOhm", snapshot.threshold_ohm),
@@ -2149,6 +3307,7 @@ class GizmoOpcUaServer:
 
     def _apply_time(self, snapshot: TimeSnapshot) -> None:
         stamp = snapshot.observed_at
+        self._latest_time_snapshot = snapshot
         local_time = stamp.astimezone().isoformat(timespec="seconds")
         for path, value in (
             ("Time.CurrentUtc", stamp),
@@ -2328,6 +3487,8 @@ class GizmoOpcUaServer:
     def _apply_services(self, snapshot: ServiceInventorySnapshot) -> None:
         stamp = snapshot.observed_at
         for service in snapshot.services:
+            if service.unit == "gizmo-zmon.service":
+                self._zmon_pid = service.main_pid
             points = self._ensure_service_points(service.unit)
             values = {
                 "Unit": service.unit,
@@ -2540,6 +3701,7 @@ class GizmoOpcUaServer:
                 self._mark_prefix_failed(name, error)
 
     def _forward_configuration_writes(self) -> None:
+        active = self._active_command
         requested_thresholds = (
             int(self.configuration_threshold.get_value()),
             int(self.legacy_threshold.get_value()),
@@ -2570,6 +3732,26 @@ class GizmoOpcUaServer:
                 result,
                 QUALITY_GOOD,
                 utc_now(),
+            )
+            if active is not None and active.name == "ThresholdOhm":
+                self._set_command_running(
+                    active.command_id,
+                    "threshold",
+                    f"Accepted: {self._require_accepted_reply(result)}; awaiting measurement readback",
+                    timeout_seconds=self._configured_timeout(
+                        "GIZMO_OPCUA_COMMAND_TIMEOUT_SECONDS", 60
+                    ),
+                    expected_value=requested_threshold,
+                )
+        elif (
+            active is not None
+            and active.name == "ThresholdOhm"
+            and active.verification == "pending-write"
+        ):
+            self._finish_command(
+                active.command_id,
+                "Succeeded",
+                f"Threshold already read back as {self._last_threshold} ohm; no restart required",
             )
 
         requested_intervals = (
@@ -2606,6 +3788,26 @@ class GizmoOpcUaServer:
                 QUALITY_GOOD,
                 utc_now(),
             )
+            if active is not None and active.name == "AveragesPerCalculation":
+                self._set_command_running(
+                    active.command_id,
+                    "averages",
+                    f"Accepted: {self._require_accepted_reply(result)}; awaiting measurement readback",
+                    timeout_seconds=self._configured_timeout(
+                        "GIZMO_OPCUA_COMMAND_TIMEOUT_SECONDS", 60
+                    ),
+                    expected_value=requested_interval,
+                )
+        elif (
+            active is not None
+            and active.name == "AveragesPerCalculation"
+            and active.verification == "pending-write"
+        ):
+            self._finish_command(
+                active.command_id,
+                "Succeeded",
+                f"Averaging count already read back as {self._last_run_interval}; no restart required",
+            )
 
         requested_time = self.legacy_set_time.get_value()
         if requested_time != self._last_time:
@@ -2637,6 +3839,225 @@ class GizmoOpcUaServer:
                 "normalizeMagFlag=1\n",
             )
             self.legacy_normalize.set_value(0)
+
+    def _fresh_measurement_for(self, command: ActiveCommand) -> bool:
+        return bool(
+            self._last_good_measurement_sequence > command.start_sequence
+            and self._last_good_measurement_at is not None
+            and self._last_good_measurement_at >= command.requested_at
+        )
+
+    def _normal_mode_verified(self, command: ActiveCommand) -> tuple[bool, str]:
+        if not self._fresh_measurement_for(command):
+            return False, "waiting for a fresh good measurement"
+        if self._zmon_pid <= 0:
+            return False, "waiting for an active measurement-engine PID"
+        if command.start_pid > 0 and self._zmon_pid == command.start_pid:
+            return False, "waiting for a new measurement-engine PID"
+        observed_hash = self._sha256_file(ZMON_BINARY)
+        if not command.expected_hash:
+            return False, "expected measurement-engine hash is unavailable"
+        if observed_hash != command.expected_hash:
+            return False, "measurement-engine executable hash changed"
+        evidence = (
+            f"PID {self._zmon_pid}, SHA-256 {observed_hash}, "
+            f"fresh sequence {self._last_good_measurement_sequence}"
+        )
+        return True, evidence
+
+    def _advance_active_command(self, now: float) -> None:
+        with self._command_lock:
+            command = self._active_command
+            if command is None or command.verification in {
+                "dispatching",
+                "pending-write",
+            }:
+                return
+
+            if command.verification == "clear-latch":
+                if self._fresh_measurement_for(command):
+                    snapshot = self._last_measurement_snapshot
+                    if snapshot is not None and not snapshot.alarm_latched:
+                        self._finish_command(
+                            command.command_id,
+                            "Succeeded",
+                            (
+                                "Latch clear verified by fresh measurement "
+                                f"sequence {snapshot.sequence}"
+                            ),
+                        )
+                        return
+                    if snapshot is not None and snapshot.alarm_active:
+                        self._finish_command(
+                            command.command_id,
+                            "Succeeded",
+                            (
+                                "Latch clear was accepted; the active physical alarm "
+                                f"remains asserted at sequence {snapshot.sequence}"
+                            ),
+                        )
+                        return
+
+            verified, evidence = self._normal_mode_verified(command)
+            if verified:
+                snapshot = self._last_measurement_snapshot
+                if command.verification == "threshold":
+                    if (
+                        snapshot is not None
+                        and snapshot.threshold_ohm is not None
+                        and command.expected_value is not None
+                        and int(snapshot.threshold_ohm)
+                        == int(command.expected_value)
+                    ):
+                        self._finish_command(
+                            command.command_id,
+                            "Succeeded",
+                            f"Threshold readback {int(command.expected_value)} ohm verified; {evidence}",
+                        )
+                        return
+                elif command.verification == "averages":
+                    if snapshot is not None and int(
+                        snapshot.averages_per_calculation
+                    ) == int(command.expected_value):
+                        self._finish_command(
+                            command.command_id,
+                            "Succeeded",
+                            f"Averaging readback {int(command.expected_value)} verified; {evidence}",
+                        )
+                        return
+                elif command.verification == "restart":
+                    self._finish_command(
+                        command.command_id,
+                        "Succeeded",
+                        f"Measurement-engine restart verified; {evidence}",
+                    )
+                    return
+                elif command.verification == "calibration":
+                    result = (
+                        "Calibration sweep completed and normal acquisition resumed; "
+                        "new tables remain subject to independent validation and activation; "
+                        f"{evidence}"
+                    )
+                    self._set_calibration_operation(
+                        "Completed",
+                        progress=100.0,
+                        result=result,
+                        restoration="Verified",
+                        terminal=True,
+                    )
+                    self._next_run["Calibration"] = 0.0
+                    self._finish_command(command.command_id, "Succeeded", result)
+                    return
+                elif command.verification == "calibration-timeout-restore":
+                    result = f"Calibration timed out; normal acquisition restoration verified; {evidence}"
+                    self._set_calibration_operation(
+                        "Failed",
+                        progress=None,
+                        result=result,
+                        restoration="Verified",
+                        terminal=True,
+                    )
+                    self._finish_command(command.command_id, "TimedOut", result)
+                    return
+                elif command.verification == "restore":
+                    terminal = command.terminal_calibration_state or "Idle"
+                    result = f"Normal acquisition restoration verified; {evidence}"
+                    self._command_fault_locked = False
+                    self._set_calibration_operation(
+                        terminal,
+                        progress=None,
+                        result=result,
+                        restoration="Verified",
+                        terminal=True,
+                    )
+                    self._finish_command(command.command_id, "Succeeded", result)
+                    return
+                elif command.verification == "set-time":
+                    observed = self._latest_time_snapshot
+                    if observed is not None and abs(
+                        observed.observed_at.timestamp() - float(command.expected_value)
+                    ) <= 5:
+                        self._finish_command(
+                            command.command_id,
+                            "Succeeded",
+                            f"System-time and acquisition readback verified; {evidence}",
+                        )
+                        return
+                elif command.verification == "capture-adc":
+                    try:
+                        status = state_path("adc.csv").stat()
+                    except OSError:
+                        status = None
+                    max_bytes = int(
+                        os.environ.get("GIZMO_OPCUA_ADC_MAX_BYTES", str(16 * 1024**2))
+                    )
+                    if (
+                        status is not None
+                        and status.st_mtime >= float(command.expected_value) - 1
+                        and 0 < status.st_size <= max_bytes
+                    ):
+                        self._finish_command(
+                            command.command_id,
+                            "Succeeded",
+                            f"ADC capture {status.st_size} bytes and normal acquisition verified; {evidence}",
+                        )
+                        return
+
+            if now < command.deadline_monotonic:
+                return
+
+            if command.verification == "calibration" and not command.restore_attempted:
+                try:
+                    reply = self._require_accepted_reply(
+                        self.request(f"run {self._last_run_interval}")
+                    )
+                    command.restore_attempted = True
+                    command.verification = "calibration-timeout-restore"
+                    command.start_sequence = self._last_good_measurement_sequence
+                    command.start_pid = self._zmon_pid
+                    command.deadline_monotonic = now + self._configured_timeout(
+                        "GIZMO_OPCUA_RESTORE_TIMEOUT_SECONDS", 90
+                    )
+                    self._audit["result"] = self._bounded(
+                        f"Calibration timed out; restoration commanded: {reply}",
+                        COMMAND_RESULT_LIMIT,
+                    )
+                    self._set_calibration_operation(
+                        "Restoring",
+                        progress=None,
+                        result=self._audit["result"],
+                        restoration="Commanded",
+                    )
+                    self._publish_audit()
+                    self._persist_command_state()
+                    self._next_run["Measurement"] = 0.0
+                    self._next_run["Services"] = 0.0
+                    return
+                except Exception as error:
+                    evidence = f"automatic normal-state restoration failed: {error}"
+
+            fault = command.verification in {
+                "calibration",
+                "calibration-timeout-restore",
+                "restore",
+                "restart",
+            }
+            result = f"Command verification timed out: {evidence}"
+            if command.verification in {
+                "calibration",
+                "calibration-timeout-restore",
+                "restore",
+            }:
+                self._set_calibration_operation(
+                    "Failed",
+                    progress=None,
+                    result=result,
+                    restoration="Failed",
+                    terminal=True,
+                )
+            self._finish_command(
+                command.command_id, "TimedOut", result, fault_locked=fault
+            )
 
     def _finish_adc_capture(self, now: float) -> None:
         if self._adc_ready_at is not None and now >= self._adc_ready_at:
@@ -2683,6 +4104,15 @@ class GizmoOpcUaServer:
                         QUALITY_BAD,
                         utc_now(),
                     )
+                    active = self._active_command
+                    if active is not None and active.verification == "pending-write":
+                        self._finish_command(
+                            active.command_id,
+                            "Failed",
+                            f"Configuration write failed: {error}",
+                        )
+
+                self._advance_active_command(now)
 
                 if not self._ready_sent and self._attempted >= set(specs):
                     overall = self._points["Health.Overall"][0].get_value()

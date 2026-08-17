@@ -1,7 +1,7 @@
 # GIZMo Kria runtime
 
-This source-only public edition turns the maintained GIZMo Kria slow-controls
-runtime into one package, `gizmo-runtime`, with one operational entry point:
+This source-only public edition turns the maintained GIZMo Kria SC/DPS runtime
+into one package, `gizmo-runtime`, with one operational entry point:
 `gizmo.target`. Device images, recovered filesystem content, calibration/state
 bundles, site configuration, supplied manuals, and reviewed third-party
 dependencies are deliberately excluded.
@@ -12,8 +12,13 @@ persistent historian, and web-dashboard components. Systemd owns startup
 ordering, privileges, restarts, logs, and shutdown. Operators still start and
 stop the product as one unit.
 
-> Status: runtime 0.4.6 is the maintained package. It publishes model 1.3.1
-> as a deterministic, machine-readable Kria OPC UA contract for Slow Controls.
+> Status: runtime 0.5.1 is the maintained package. It publishes OPC UA model
+> 1.4.0 as the authoritative GIZMo--SC/DPS interface contract. Model 1.4 adds
+> command audit and gate state, calibration/restoration state, narrow recovery
+> methods, and the reserved stimulus-current monitor requested by the DCS
+> intake workbook. Anonymous monitoring remains read-only and the command gate
+> is disabled by default. Runtime 0.4.6 added a deterministic, machine-readable
+> contract artifact.
 > Runtime 0.4.5 added an explicit
 > unlimited-retention policy for permanent off-board replicas while keeping
 > the Kria historian as a bounded 14-day edge buffer. Runtime 0.4.4 added
@@ -92,7 +97,7 @@ ARM64 wheel hashes are pinned in
 `packaging/wheelhouse-arm64.sha256` and checked before an offline package
 build.
 
-The Kria implementation is the authority for the GIZMo--Slow Controls
+The Kria implementation is the authority for the GIZMo--SC/DPS
 contract: the typed OPC UA namespace `urn:fnal:gizmo`, normally served on TCP
 4840. It exposes measurement quality and source
 timestamps along with OS, network, firmware, time, service, calibration, and
@@ -101,6 +106,7 @@ SDR status:
 ```sh
 gizmo-opcua-client health
 gizmo-opcua-client measurement
+gizmo-opcua-client command-status
 gizmo-opcua-client snapshot
 gizmo-opcua-client schema
 ```
@@ -118,7 +124,7 @@ profile is maintained in
 It keeps the canonical nodes and metadata even where that hardware has a
 narrower capability; in particular, its accepted threshold-write subset is
 0--1023 ohm while the authoritative contract range remains 0--1,000,000 ohm.
-Slow Controls connects to the two endpoints independently.
+SC/DPS connects to the two endpoints independently.
 
 The generic off-board replica design is described in the
 [off-board monitoring guide](docs/offboard-monitoring.md). The reusable
@@ -137,7 +143,7 @@ The Kria clock is synchronized at boot with `systemd-timesyncd`; see the
 [time-synchronization guide](docs/time-synchronization.md).
 
 The human-facing connection, power-up, construction-monitoring guide and the
-dual-platform Slow Controls ICD are maintained in
+dual-platform GIZMo--SC/DPS ICD are maintained in
 [`marroyav/gizmo-icd`](https://github.com/marroyav/gizmo-icd). The Ignition
 resources are maintained separately in
 [`marroyav/gizmo-ignition`](https://github.com/marroyav/gizmo-ignition), and
@@ -166,7 +172,7 @@ Read [the migration procedure](docs/migration.md) before touching a running
 legacy image. The safe high-level sequence is:
 
 ```sh
-sudo dpkg -i build/gizmo-runtime_0.4.6_arm64.deb
+sudo dpkg -i --force-confold build/gizmo-runtime_0.5.1_arm64.deb
 sudo gizmo-doctor
 ```
 

@@ -36,7 +36,10 @@ PYTHONPYCACHEPREFIX="$temporary/pycache" "$test_python" -m compileall -q \
     "$repo_root/src/python" "$repo_root/tests"
 PYTHONPYCACHEPREFIX="$temporary/pycache" "$test_python" -m py_compile \
     "$repo_root/scripts/gizmo-opcua-client" \
-    "$repo_root/tools/generate-opcua-contract.py"
+    "$repo_root/scripts/gizmo-opcua-user" \
+    "$repo_root/tools/generate-opcua-contract.py" \
+    "$repo_root/tools/validate-dcs-intake.py" \
+    "$repo_root/tools/validate-python-bundle.py"
 echo "ok   Python syntax"
 
 PYTHONPYCACHEPREFIX="$temporary/pycache" "$test_python" \
@@ -53,6 +56,10 @@ echo "ok   command compatibility tests"
 PYTHONPYCACHEPREFIX="$temporary/pycache" "$test_python" \
     "$repo_root/tests/test_opcua_model.py"
 echo "ok   OPC UA semantic model tests"
+
+PYTHONPYCACHEPREFIX="$temporary/pycache" "$test_python" \
+    "$repo_root/tests/test_opcua_security.py"
+echo "ok   OPC UA credential policy tests"
 
 PYTHONPYCACHEPREFIX="$temporary/pycache" "$test_python" \
     "$repo_root/tests/test_dashboard.py"

@@ -23,6 +23,29 @@ from gizmo_model import REQUIRED_UNITS, SYSTEMD_UNITS
 
 
 class DashboardContractTests(unittest.TestCase):
+    def test_resistance_calibration_exposes_magnitude_rms_and_phase(self) -> None:
+        parsed = dashboard.parse_resistance_calibration(
+            "0, 100, -10, -170, 499.5, 200, -5, 175"
+        )
+
+        self.assertEqual(parsed["row_count"], 2)
+        self.assertEqual(parsed["rows"][1]["z_ohm"], 499.5)
+        self.assertAlmostEqual(
+            parsed["rows"][0]["sine_rms_estimate_count"],
+            100 / math.sqrt(2),
+        )
+        self.assertEqual(parsed["rows"][1]["phase_atan2_degrees"], 175)
+        self.assertEqual(
+            parsed["rms_definition"],
+            "lockin_magnitude_count / sqrt(2)",
+        )
+
+    def test_resistance_calibration_rejects_malformed_rows(self) -> None:
+        for payload in ("", "0,1,2", "0,nan,2,3", "-1,2,3,4"):
+            with self.subTest(payload=payload):
+                with self.assertRaises(ValueError):
+                    dashboard.parse_resistance_calibration(payload)
+
     def test_catalog_paths_are_unique_and_every_view_is_chartable(self) -> None:
         paths = [spec.path for spec in dashboard.VARIABLES]
 
@@ -32,6 +55,22 @@ class DashboardContractTests(unittest.TestCase):
             for path in view["paths"]:
                 self.assertIn(path, dashboard.CATALOG)
                 self.assertTrue(dashboard.CATALOG[path].chartable)
+
+    def test_model14_status_points_are_visible_without_changing_chart_layout(self) -> None:
+        expected = {
+            "Measurement.StimulusCurrentRmsAmpere",
+            "Operations.CommandGateState",
+            "Operations.LastCommandState",
+            "Operations.LastCommandResult",
+            "Calibration.OperationState",
+            "Calibration.ProgressPercent",
+            "Calibration.RestorationState",
+        }
+
+        self.assertTrue(expected <= dashboard.CATALOG.keys())
+        self.assertTrue(
+            all(not dashboard.CATALOG[path].chartable for path in expected)
+        )
 
     def test_service_paths_use_the_canonical_safe_node_identifier(self) -> None:
         self.assertEqual(
@@ -110,6 +149,13 @@ class DashboardContractTests(unittest.TestCase):
         self.assertIn('const ALARM_COLOR = "#ff6a2a"', javascript)
         self.assertIn('alarm: "Authoritative composite relay/beacon alarm', javascript)
         self.assertIn("function drawCharts()", javascript)
+        self.assertIn('id="zoom-in-button"', html)
+        self.assertIn('id="telemetry-zoom-state"', html)
+        self.assertIn('id="calibration-canvas"', html)
+        self.assertIn('id="calibration-zoom-state"', html)
+        self.assertIn("function setTelemetryZoom", javascript)
+        self.assertIn("function drawCalibration", javascript)
+        self.assertIn('fetch("/api/calibration/resistance"', javascript)
 
         alarm_view = next(
             view for view in dashboard.CHART_VIEWS if view["id"] == "alarm"
@@ -152,6 +198,15 @@ class FakeMonitor:
                 "endpoint": "opc.tcp://127.0.0.1:4840",
             },
             "values": {},
+        }
+
+    def resistance_calibration(self) -> dict[str, object]:
+        return {
+            **dashboard.parse_resistance_calibration("0,100,-10,-170"),
+            "status": "Good",
+            "source_timestamp": "2026-07-27T12:00:00+00:00",
+            "received_at": "2026-07-27T12:00:01+00:00",
+            "error": "",
         }
 
 
@@ -205,6 +260,16 @@ class DashboardHttpTests(unittest.TestCase):
         self.assertFalse(catalog["history_available"])
         self.assertTrue(health["opcua_connected"])
         self.assertFalse(health["historian_available"])
+
+    def test_live_resistance_calibration_endpoint(self) -> None:
+        body, _ = self.read("/api/calibration/resistance")
+        calibration = json.loads(body)
+
+        self.assertEqual(calibration["status"], "Good")
+        self.assertEqual(calibration["row_count"], 1)
+        self.assertEqual(calibration["validated_max_z_ohm"], 500)
+        self.assertEqual(calibration["rows"][0]["z_ohm"], 0)
+        self.assertIn("RCalData", calibration["source"])
 
     def test_unavailable_historian_is_a_bounded_degraded_route(self) -> None:
         self.assertEqual(

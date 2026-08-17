@@ -158,10 +158,13 @@ second full-retention replay of 14 days raw, 30 days platform, one year of
 rollups, and five years at 100 events/day occupied about 1.26 GB
 (1.17 GiB). Real event volume is expected to be much lower.
 
-The live `/status` response also estimates monthly bytes from the current
-average payload sizes. Payload size varies slightly with strings and status
-details, so a long board soak should replace the short replay for final eMMC
-wear planning.
+The live `/status` response also estimates monthly bytes from recent payload
+sizes. Exact row counts use narrow covering indexes; payload-size averages use
+at most the latest 4,096 rows per retained table. This keeps the status route
+responsive when the database contains millions of samples while weighting the
+estimate toward the currently installed model. Payload size varies with
+strings and status details, so a long board soak should replace the short
+replay for final eMMC wear planning.
 
 ## Read-only query interface
 

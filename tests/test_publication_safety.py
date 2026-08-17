@@ -20,6 +20,8 @@ class PublicationSafetyTests(unittest.TestCase):
         server = (ROOT / "src/python/gizmo_opcua.py").read_text()
         self.assertIn("GIZMO_NETWORK_MODE=none", network)
         self.assertIn("GIZMO_OPCUA_ALLOW_INSECURE=0", runtime)
+        self.assertIn("GIZMO_OPCUA_ALLOW_INSECURE_CREDENTIALS=0", runtime)
+        self.assertIn("GIZMO_OPCUA_COMMAND_GATE=disabled", runtime)
         self.assertIn('os.environ.get("GIZMO_OPCUA_ALLOW_INSECURE", "0")', server)
         self.assertIn("GIZMO_HISTORIAN_RETENTION_ENABLED=1", runtime)
         self.assertIn("GIZMO_HISTORIAN_RETENTION_ENABLED=0", replica)

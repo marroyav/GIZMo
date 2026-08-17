@@ -59,7 +59,9 @@ def fake_snapshot(second: int, *, high_z: bool = False) -> dict[str, object]:
     values["Measurement.ResistanceOhm"]["value"] = (
         None if high_z else 200.0 + second
     )
-    values["Measurement.ResistanceOhm"]["status"] = "Good"
+    values["Measurement.ResistanceOhm"]["status"] = (
+        "Good"
+    )
     values["Measurement.ResistanceRange"]["value"] = (
         "OutOfRange" if high_z else "InRange"
     )
@@ -100,6 +102,56 @@ class HistorianTests(unittest.TestCase):
                 connection.execute("PRAGMA auto_vacuum").fetchone()[0],
                 2,
             )
+
+    def test_storage_status_uses_bounded_covering_index_scans(self) -> None:
+        with sqlite3.connect(self.database) as connection:
+            for table, index in (
+                ("fast_sample", "fast_sample_status_scan"),
+                ("platform_sample", "platform_sample_status_scan"),
+                ("minute_rollup", "minute_rollup_status_scan"),
+            ):
+                indexes = {
+                    row[1]
+                    for row in connection.execute(f"PRAGMA index_list({table})")
+                }
+                self.assertIn(index, indexes)
+
+        original_limit = historian.STATUS_AVERAGE_SAMPLE_ROWS
+        historian.STATUS_AVERAGE_SAMPLE_ROWS = 2
+        try:
+            self.store.writer.executemany(
+                """
+                INSERT INTO fast_sample(
+                    receive_time_us, stream_id, sequence, payload
+                ) VALUES(?, ?, ?, ?)
+                """,
+                (
+                    (1, self.stream, 1, b"x"),
+                    (2, self.stream, 2, b"yy"),
+                    (3, self.stream, 3, b"zzzz"),
+                ),
+            )
+            self.store.writer.commit()
+            status = self.store.storage_status()
+        finally:
+            historian.STATUS_AVERAGE_SAMPLE_ROWS = original_limit
+
+        self.assertEqual(status["fast_samples"]["count"], 3)
+        self.assertEqual(status["fast_samples"]["average_payload_bytes"], 3)
+        self.assertEqual(
+            status["fast_samples"]["average_payload_sample_rows"],
+            2,
+        )
+
+    def test_model14_command_and_calibration_state_are_event_paths(self) -> None:
+        self.assertIn("Operations.LastCommandState", historian.EVENT_PATHS)
+        self.assertIn("Operations.LastCommandResult", historian.EVENT_PATHS)
+        self.assertIn("Calibration.OperationState", historian.EVENT_PATHS)
+        self.assertIn("Calibration.RestorationState", historian.EVENT_PATHS)
+        self.assertNotIn(
+            "Measurement.StimulusCurrentRmsAmpere",
+            historian.FAST_CAPTURE_PATHS,
+        )
 
     def test_payload_round_trip_preserves_status_and_source_time(self) -> None:
         snapshot = fake_snapshot(1, high_z=True)
@@ -230,6 +282,10 @@ class HistorianTests(unittest.TestCase):
         self.assertIn("Measurement.ResistanceRange", exported)
         self.assertEqual(status["fast_samples"]["count"], 1)
         self.assertEqual(status["platform_samples"]["count"], 1)
+        self.assertEqual(
+            status["fast_samples"]["average_payload_sample_rows"],
+            1,
+        )
         self.assertGreater(
             status["projected_month_bytes_from_payloads"],
             0,

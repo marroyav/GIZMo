@@ -143,6 +143,28 @@ def read_paths(
     }
 
 
+COMMAND_STATUS_PATHS = (
+    "Operations.CommandGateState",
+    "Operations.LastCommandId",
+    "Operations.LastCommandName",
+    "Operations.LastCommandParameters",
+    "Operations.LastCommandRequester",
+    "Operations.LastCommandState",
+    "Operations.LastCommandRequestTime",
+    "Operations.LastCommandCompletionTime",
+    "Operations.LastCommandResult",
+    "Calibration.OperationState",
+    "Calibration.ProgressPercent",
+    "Calibration.LastOperationTime",
+    "Calibration.LastOperationResult",
+    "Calibration.RestorationState",
+)
+
+
+def command_status(client: Client, namespace: int) -> dict[str, Any]:
+    return read_paths(client, namespace, COMMAND_STATUS_PATHS)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Read and operate the canonical GIZMo OPC UA namespace"
@@ -160,6 +182,10 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("health", help="read aggregate health")
     subparsers.add_parser("measurement", help="read the latest impedance result")
+    subparsers.add_parser(
+        "command-status",
+        help="read the command gate, audit result, and calibration state",
+    )
     snapshot = subparsers.add_parser(
         "snapshot", help="browse and read the complete canonical namespace"
     )
@@ -178,6 +204,18 @@ def build_parser() -> argparse.ArgumentParser:
     calibration.add_argument("reads_per_point", type=int)
     subparsers.add_parser("capture-adc", help="call CaptureAdc")
     subparsers.add_parser("normalize-magnitude", help="call NormalizeMagnitude")
+    subparsers.add_parser(
+        "restart-measurement-engine",
+        help="restart only ZMon; maintenance role and gate are required",
+    )
+    subparsers.add_parser(
+        "abort-calibration",
+        help="abort calibration and restore normal acquisition",
+    )
+    subparsers.add_parser(
+        "restore-normal-state",
+        help="request and verify normal acquisition after a fault",
+    )
     set_time = subparsers.add_parser(
         "set-time", help="call SetSystemTime with an absolute ISO-8601 timestamp"
     )
@@ -234,6 +272,7 @@ def main() -> None:
                     "Measurement.CapacitanceRange",
                     "Measurement.ThresholdOhm",
                     "Measurement.StimulusFrequencyHertz",
+                    "Measurement.StimulusCurrentRmsAmpere",
                     "Measurement.Quality",
                     "Measurement.Diagnostic",
                     "Alarm.Active",
@@ -242,6 +281,8 @@ def main() -> None:
                     "Alarm.LatchTime",
                 ),
             )
+        elif args.command == "command-status":
+            result = command_status(client, namespace)
         elif args.command == "snapshot":
             root = canonical_node(client, namespace, "Device")
             result = browse_snapshot(root, include_sdr_frame=args.include_sdr_frame)
@@ -299,11 +340,20 @@ def main() -> None:
                         ua.VariantType.DateTime,
                     )
                 ]
+            elif args.command == "restart-measurement-engine":
+                method_name, arguments = "RestartMeasurementEngine", []
+            elif args.command == "abort-calibration":
+                method_name, arguments = "AbortCalibration", []
+            elif args.command == "restore-normal-state":
+                method_name, arguments = "RestoreNormalState", []
             else:
                 method_name, arguments = "NormalizeMagnitude", []
             method = canonical_node(client, namespace, f"Operations.{method_name}")
             reply = operations.call_method(method, *arguments)
-            result = {"result": json_value(reply)}
+            result = {
+                "acceptance_result": json_value(reply),
+                "command_status": command_status(client, namespace),
+            }
         print(json.dumps(result, indent=2, sort_keys=True))
     finally:
         client.disconnect()

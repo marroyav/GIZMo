@@ -13,6 +13,9 @@
   const NORMAL_COLOR = "#b8c41f";
   const ALARM_COLOR = "#ff6a2a";
   const THRESHOLD_COLOR = "#747d86";
+  const CALIBRATION_MAGNITUDE_COLOR = "#b8c41f";
+  const CALIBRATION_RMS_COLOR = "#4f7f86";
+  const CALIBRATION_PHASE_COLOR = "#8d7fb8";
   const HIGH_Z_SERIES_PATH = "__display.high_z_floor__";
   const MAX_HISTORY_SECONDS = 3600;
   const HISTORY_MAX_POINTS = 5000;
@@ -73,10 +76,29 @@
     historyRange: byId("history-range"),
     historyFrom: byId("history-from"),
     historyTo: byId("history-to"),
+    telemetryZoomState: byId("telemetry-zoom-state"),
+    zoomInButton: byId("zoom-in-button"),
+    zoomOutButton: byId("zoom-out-button"),
+    zoomResetButton: byId("zoom-reset-button"),
     pauseButton: byId("pause-button"),
     exportButton: byId("export-button"),
     chartStack: byId("chart-stack"),
     plotState: byId("plot-state"),
+    calibrationPointCount: byId("calibration-point-count"),
+    calibrationZRange: byId("calibration-z-range"),
+    calibrationRmsPeak: byId("calibration-rms-peak"),
+    calibrationOpenAnchor: byId("calibration-open-anchor"),
+    calibrationPlotShell: byId("calibration-plot-shell"),
+    calibrationCanvas: byId("calibration-canvas"),
+    calibrationEmpty: byId("calibration-empty"),
+    calibrationEmptyTitle: byId("calibration-empty-title"),
+    calibrationEmptyCopy: byId("calibration-empty-copy"),
+    calibrationTooltip: byId("calibration-tooltip"),
+    calibrationState: byId("calibration-state"),
+    calibrationZoomState: byId("calibration-zoom-state"),
+    calibrationZoomIn: byId("calibration-zoom-in"),
+    calibrationZoomOut: byId("calibration-zoom-out"),
+    calibrationZoomReset: byId("calibration-zoom-reset"),
     healthGrid: byId("health-grid"),
     healthSummary: byId("health-summary"),
     networkGrid: byId("network-grid"),
@@ -108,6 +130,8 @@
     historyFromMs: null,
     historyToMs: null,
     historyRequest: 0,
+    zoomDomain: null,
+    telemetryDrag: null,
     customView: null,
     chartPanels: new Map(),
     hoverViewId: null,
@@ -121,6 +145,11 @@
     hoverTime: null,
     drawPending: false,
     highZFloorOhm: 500,
+    calibration: null,
+    calibrationSignature: null,
+    calibrationDomain: null,
+    calibrationHoverIndex: null,
+    calibrationDrag: null,
   };
 
   function element(tag, className, text) {
@@ -209,6 +238,14 @@
     if (days) return `${days}d ${hours}h`;
     if (hours) return `${hours}h ${minutes}m`;
     return `${minutes}m`;
+  }
+
+  function formatPlotSpan(milliseconds) {
+    const seconds = Math.max(0, milliseconds / 1000);
+    if (seconds < 60) return `${formatNumber(seconds, seconds < 10 ? 1 : 0)}s`;
+    if (seconds < 3600) return `${formatNumber(seconds / 60, 1)}m`;
+    if (seconds < 86400) return `${formatNumber(seconds / 3600, 1)}h`;
+    return `${formatNumber(seconds / 86400, 1)}d`;
   }
 
   function parseDate(value) {
@@ -342,7 +379,7 @@
     return { start: end - seconds * 1000, end };
   }
 
-  function plotDomain(samples = activeSamples()) {
+  function basePlotDomain(samples = activeSamples()) {
     if (
       state.plotMode === "history" &&
       state.historyFromMs !== null &&
@@ -362,8 +399,92 @@
     };
   }
 
+  function plotDomain(samples = activeSamples()) {
+    const base = basePlotDomain(samples);
+    if (!state.zoomDomain) return base;
+    const duration = Math.min(state.zoomDomain.duration, base.duration);
+    if (state.plotMode === "live" && state.zoomDomain.followLatest) {
+      return {
+        start: base.end - duration,
+        end: base.end,
+        duration,
+      };
+    }
+    let start = Math.max(base.start, state.zoomDomain.start);
+    let end = start + duration;
+    if (end > base.end) {
+      end = base.end;
+      start = end - duration;
+    }
+    return { start, end, duration: end - start };
+  }
+
+  function updateTelemetryZoomControls() {
+    const zoomed = Boolean(state.zoomDomain);
+    dom.zoomResetButton.disabled = !zoomed;
+    const base = basePlotDomain();
+    const current = plotDomain();
+    dom.zoomOutButton.disabled = !zoomed || current.duration >= base.duration;
+    dom.telemetryZoomState.textContent = zoomed
+      ? `${formatPlotSpan(current.duration)} visible${state.zoomDomain.followLatest ? " · live edge" : ""}`
+      : `${formatPlotSpan(base.duration)} full range`;
+  }
+
+  function resetTelemetryZoom(redraw = true) {
+    state.zoomDomain = null;
+    updateTelemetryZoomControls();
+    if (redraw) scheduleDraw();
+  }
+
+  function setTelemetryZoom(factor, anchorFraction = 0.5) {
+    const base = basePlotDomain();
+    const current = plotDomain();
+    if (!Number.isFinite(base.duration) || base.duration <= 0) return;
+    const minimum = Math.min(base.duration, Math.max(2000, base.duration / 1000));
+    const nextDuration = Math.max(
+      minimum,
+      Math.min(base.duration, current.duration * factor),
+    );
+    if (nextDuration >= base.duration * 0.999) {
+      resetTelemetryZoom();
+      return;
+    }
+    const anchor = current.start + current.duration * anchorFraction;
+    let start = anchor - nextDuration * anchorFraction;
+    start = Math.max(base.start, Math.min(start, base.end - nextDuration));
+    state.zoomDomain = {
+      start,
+      end: start + nextDuration,
+      duration: nextDuration,
+      followLatest: state.plotMode === "live" && anchorFraction >= 0.95,
+    };
+    updateTelemetryZoomControls();
+    hideTooltip();
+    scheduleDraw();
+  }
+
+  function panTelemetry(fraction) {
+    if (!state.zoomDomain || !Number.isFinite(fraction)) return;
+    const base = basePlotDomain();
+    const current = plotDomain();
+    const duration = current.duration;
+    let start = current.start + duration * fraction;
+    start = Math.max(base.start, Math.min(start, base.end - duration));
+    state.zoomDomain = {
+      start,
+      end: start + duration,
+      duration,
+      followLatest:
+        state.plotMode === "live" &&
+        Math.abs(start + duration - base.end) < 1,
+    };
+    updateTelemetryZoomControls();
+    scheduleDraw();
+  }
+
   async function loadHistory() {
     if (state.plotMode !== "history") return;
+    resetTelemetryZoom(false);
     const paths = plotPaths();
     if (!paths.length) return;
     const requestId = ++state.historyRequest;
@@ -433,6 +554,7 @@
 
   function setPlotMode(mode) {
     state.plotMode = mode === "history" ? "history" : "live";
+    resetTelemetryZoom(false);
     dom.modeSelect.value = state.plotMode;
     dom.trendModeLabel.textContent =
       state.plotMode === "history" ? "Persistent history" : "Live telemetry";
@@ -821,6 +943,52 @@
     dom.variableCount.textContent = `${visible} of ${state.catalog.length} variables`;
   }
 
+  function telemetryWheel(event, canvas) {
+    if (!activeSamples().length) return;
+    event.preventDefault();
+    const rect = canvas.getBoundingClientRect();
+    const padding = { left: 58, right: 20 };
+    const width = Math.max(1, rect.width - padding.left - padding.right);
+    const anchor = Math.max(
+      0,
+      Math.min(1, (event.clientX - rect.left - padding.left) / width),
+    );
+    setTelemetryZoom(event.deltaY > 0 ? 1.35 : 0.74, anchor);
+  }
+
+  function beginTelemetryPan(event, canvas) {
+    if (event.button !== 0 || !state.zoomDomain) return;
+    const rect = canvas.getBoundingClientRect();
+    state.telemetryDrag = {
+      pointerId: event.pointerId,
+      canvas,
+      lastX: event.clientX,
+      plotWidth: Math.max(1, rect.width - 78),
+    };
+    canvas.classList.add("is-dragging");
+    canvas.setPointerCapture(event.pointerId);
+    hideTooltip();
+  }
+
+  function moveTelemetryPan(event) {
+    const drag = state.telemetryDrag;
+    if (!drag || drag.pointerId !== event.pointerId) return false;
+    const delta = event.clientX - drag.lastX;
+    drag.lastX = event.clientX;
+    panTelemetry(-delta / drag.plotWidth);
+    return true;
+  }
+
+  function endTelemetryPan(event) {
+    const drag = state.telemetryDrag;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    drag.canvas.classList.remove("is-dragging");
+    if (drag.canvas.hasPointerCapture(event.pointerId)) {
+      drag.canvas.releasePointerCapture(event.pointerId);
+    }
+    state.telemetryDrag = null;
+  }
+
   function buildChartPanels() {
     state.chartPanels.clear();
     const panels = plotViews().map((view) => {
@@ -851,6 +1019,8 @@
       const canvas = element("canvas", "trend-canvas");
       canvas.setAttribute("role", "img");
       canvas.setAttribute("aria-label", `${view.label} time-series plot`);
+      canvas.title =
+        "Wheel to zoom; drag after zooming to pan; double-click to reset.";
       const empty = element("div", "chart-empty");
       const wave = element("span", "empty-wave");
       wave.setAttribute("aria-hidden", "true");
@@ -878,9 +1048,24 @@
       };
       state.chartPanels.set(view.id, panel);
       canvas.addEventListener("mousemove", (event) => {
+        if (state.telemetryDrag) return;
         showTooltip(event, view, panel);
       });
-      canvas.addEventListener("mouseleave", hideTooltip);
+      canvas.addEventListener("mouseleave", () => {
+        if (!state.telemetryDrag) hideTooltip();
+      });
+      canvas.addEventListener(
+        "wheel",
+        (event) => telemetryWheel(event, canvas),
+        { passive: false },
+      );
+      canvas.addEventListener("pointerdown", (event) => {
+        beginTelemetryPan(event, canvas);
+      });
+      canvas.addEventListener("pointermove", moveTelemetryPan);
+      canvas.addEventListener("pointerup", endTelemetryPan);
+      canvas.addEventListener("pointercancel", endTelemetryPan);
+      canvas.addEventListener("dblclick", () => resetTelemetryZoom());
       return article;
     });
     dom.chartStack.replaceChildren(...panels);
@@ -967,6 +1152,7 @@
     requestAnimationFrame(() => {
       state.drawPending = false;
       drawCharts();
+      drawCalibration();
     });
   }
 
@@ -1329,19 +1515,23 @@
     )
       ? ` · HIGH Z clipped to ${formatNumber(state.highZFloorOhm, 0)} Ω`
       : "";
+    const zoomNote = state.zoomDomain
+      ? ` · zoomed to ${formatPlotSpan(plotDomain().duration)}`
+      : "";
+    updateTelemetryZoomControls();
     if (state.plotMode === "history") {
       if (state.historyLoading) {
         dom.plotState.textContent = "Historical query in progress…";
       } else if (state.historyResolution) {
         dom.plotState.textContent =
           `History · ${state.historyResolution} · ` +
-          `${state.historySamples.length} points${highZNote}`;
+          `${state.historySamples.length} points${highZNote}${zoomNote}`;
       }
       return;
     }
     dom.plotState.textContent = state.paused
-      ? `Plot paused · ${state.samples.length} samples retained${highZNote}`
-      : `Live · ${state.samples.length} samples retained in this browser${highZNote}`;
+      ? `Plot paused · ${state.samples.length} samples retained${highZNote}${zoomNote}`
+      : `Live · ${state.samples.length} samples retained in this browser${highZNote}${zoomNote}`;
   }
 
   function showTooltip(event, view, panel) {
@@ -1404,6 +1594,434 @@
       panel.tooltip.hidden = true;
     });
     scheduleDraw();
+  }
+
+  function calibrationRows() {
+    const maximum =
+      Number(state.calibration?.validated_max_z_ohm) || state.highZFloorOhm;
+    return (state.calibration?.rows || [])
+      .filter(
+        (row) =>
+          Number.isFinite(row.z_ohm) &&
+          Number.isFinite(row.lockin_magnitude_count) &&
+          Number.isFinite(row.sine_rms_estimate_count) &&
+          Number.isFinite(row.phase_atan2_degrees) &&
+          row.z_ohm <= maximum,
+      )
+      .sort((left, right) => left.z_ohm - right.z_ohm);
+  }
+
+  function calibrationBaseDomain() {
+    const rows = calibrationRows();
+    if (!rows.length) {
+      return { start: 0, end: state.highZFloorOhm, duration: state.highZFloorOhm };
+    }
+    const start = rows[0].z_ohm;
+    let end = rows.at(-1).z_ohm;
+    if (end <= start) end = start + 1;
+    return { start, end, duration: end - start };
+  }
+
+  function calibrationPlotDomain() {
+    const base = calibrationBaseDomain();
+    if (!state.calibrationDomain) return base;
+    const duration = Math.min(state.calibrationDomain.duration, base.duration);
+    let start = Math.max(base.start, state.calibrationDomain.start);
+    let end = start + duration;
+    if (end > base.end) {
+      end = base.end;
+      start = end - duration;
+    }
+    return { start, end, duration: end - start };
+  }
+
+  function updateCalibrationZoomControls() {
+    const zoomed = Boolean(state.calibrationDomain);
+    const domain = calibrationPlotDomain();
+    dom.calibrationZoomReset.disabled = !zoomed;
+    dom.calibrationZoomOut.disabled = !zoomed;
+    dom.calibrationZoomState.textContent = zoomed
+      ? `${formatNumber(domain.start, domain.duration < 20 ? 1 : 0)}–${formatNumber(domain.end, domain.duration < 20 ? 1 : 0)} Ω`
+      : `${formatNumber(domain.start, 0)}–${formatNumber(domain.end, 0)} Ω full range`;
+  }
+
+  function resetCalibrationZoom(redraw = true) {
+    state.calibrationDomain = null;
+    state.calibrationHoverIndex = null;
+    dom.calibrationTooltip.hidden = true;
+    updateCalibrationZoomControls();
+    if (redraw) scheduleDraw();
+  }
+
+  function setCalibrationZoom(factor, anchorFraction = 0.5) {
+    const base = calibrationBaseDomain();
+    const current = calibrationPlotDomain();
+    if (!calibrationRows().length || base.duration <= 0) return;
+    const minimum = Math.min(base.duration, Math.max(1, base.duration / 100));
+    const nextDuration = Math.max(
+      minimum,
+      Math.min(base.duration, current.duration * factor),
+    );
+    if (nextDuration >= base.duration * 0.999) {
+      resetCalibrationZoom();
+      return;
+    }
+    const anchor = current.start + current.duration * anchorFraction;
+    let start = anchor - nextDuration * anchorFraction;
+    start = Math.max(base.start, Math.min(start, base.end - nextDuration));
+    state.calibrationDomain = {
+      start,
+      end: start + nextDuration,
+      duration: nextDuration,
+    };
+    state.calibrationHoverIndex = null;
+    dom.calibrationTooltip.hidden = true;
+    updateCalibrationZoomControls();
+    scheduleDraw();
+  }
+
+  function panCalibration(fraction) {
+    if (!state.calibrationDomain || !Number.isFinite(fraction)) return;
+    const base = calibrationBaseDomain();
+    const current = calibrationPlotDomain();
+    let start = current.start + current.duration * fraction;
+    start = Math.max(base.start, Math.min(start, base.end - current.duration));
+    state.calibrationDomain = {
+      start,
+      end: start + current.duration,
+      duration: current.duration,
+    };
+    scheduleDraw();
+  }
+
+  function renderCalibrationSummary() {
+    const rows = calibrationRows();
+    const maximum =
+      Number(state.calibration?.validated_max_z_ohm) || state.highZFloorOhm;
+    const openRows = (state.calibration?.rows || [])
+      .filter((row) => Number.isFinite(row.z_ohm) && row.z_ohm > maximum)
+      .sort((left, right) => right.z_ohm - left.z_ohm);
+    dom.calibrationPointCount.textContent = rows.length
+      ? `${rows.length} in range${openRows.length ? ` + ${openRows.length} high-Z` : ""}`
+      : "—";
+    dom.calibrationZRange.textContent = rows.length
+      ? `${formatNumber(rows[0].z_ohm, 1)}–${formatNumber(rows.at(-1).z_ohm, 1)} Ω`
+      : "—";
+    const peakRms = rows.length
+      ? Math.max(...rows.map((row) => row.sine_rms_estimate_count))
+      : null;
+    dom.calibrationRmsPeak.textContent = peakRms === null
+      ? "—"
+      : `${formatNumber(peakRms, 0)} count`;
+    const open = openRows[0];
+    dom.calibrationOpenAnchor.textContent = open
+      ? `${formatAxis(open.z_ohm, open.z_ohm)} Ω · ${formatNumber(open.sine_rms_estimate_count, 0)} count`
+      : "Not present";
+    const timestamp =
+      state.calibration?.source_timestamp || state.calibration?.received_at;
+    dom.calibrationState.textContent = rows.length
+      ? `${state.calibration.status || "Unknown"} · ${state.calibration.row_count} table rows · ${relativeTime(timestamp)}`
+      : state.calibration?.error || "Installed calibration is unavailable";
+    dom.calibrationEmpty.hidden = rows.length > 0;
+    updateCalibrationZoomControls();
+  }
+
+  async function loadCalibration() {
+    try {
+      const response = await fetch("/api/calibration/resistance", {
+        cache: "no-store",
+      });
+      const payload = await response.json();
+      if (!response.ok || !Array.isArray(payload.rows) || !payload.rows.length) {
+        throw new Error(
+          payload.error || `calibration request returned ${response.status}`,
+        );
+      }
+      payload.rows = payload.rows.map((row) => ({
+        z_ohm: Number(row.z_ohm),
+        lockin_magnitude_count: Number(row.lockin_magnitude_count),
+        sine_rms_estimate_count: Number(row.sine_rms_estimate_count),
+        phase_atan_degrees: Number(row.phase_atan_degrees),
+        phase_atan2_degrees: Number(row.phase_atan2_degrees),
+      }));
+      const last = payload.rows.at(-1);
+      const signature = [
+        payload.source_timestamp,
+        payload.row_count,
+        last?.z_ohm,
+        last?.lockin_magnitude_count,
+      ].join(":");
+      const changed = state.calibrationSignature !== signature;
+      state.calibration = payload;
+      state.calibrationSignature = signature;
+      if (changed) resetCalibrationZoom(false);
+      renderCalibrationSummary();
+      scheduleDraw();
+      if (changed) addEvent(`Loaded ${payload.row_count} resistance calibration rows.`);
+    } catch (error) {
+      if (!state.calibration) {
+        dom.calibrationEmpty.hidden = false;
+        dom.calibrationEmptyTitle.textContent = "Calibration unavailable";
+        dom.calibrationEmptyCopy.textContent = error.message;
+        dom.calibrationState.textContent = `Unavailable · ${error.message}`;
+      } else {
+        dom.calibrationState.textContent = `Last usable table retained · ${error.message}`;
+      }
+      scheduleDraw();
+    }
+  }
+
+  function calibrationTrace(context, rows, x, y, field, color, dashed = false) {
+    context.strokeStyle = color;
+    context.lineWidth = 2;
+    context.lineJoin = "round";
+    context.lineCap = "round";
+    context.setLineDash(dashed ? [6, 5] : []);
+    context.beginPath();
+    rows.forEach((row, index) => {
+      const pointX = x(row.z_ohm);
+      const pointY = y(row[field]);
+      if (index === 0) context.moveTo(pointX, pointY);
+      else context.lineTo(pointX, pointY);
+    });
+    context.stroke();
+    context.setLineDash([]);
+    if (rows.length <= 100) {
+      context.fillStyle = color;
+      rows.forEach((row) => {
+        context.beginPath();
+        context.arc(x(row.z_ohm), y(row[field]), 2, 0, Math.PI * 2);
+        context.fill();
+      });
+    }
+  }
+
+  function drawCalibration() {
+    const rect = dom.calibrationCanvas.getBoundingClientRect();
+    if (!rect.width || !rect.height) return;
+    const ratio = Math.min(window.devicePixelRatio || 1, 2);
+    dom.calibrationCanvas.width = Math.round(rect.width * ratio);
+    dom.calibrationCanvas.height = Math.round(rect.height * ratio);
+    const context = dom.calibrationCanvas.getContext("2d");
+    context.scale(ratio, ratio);
+    context.clearRect(0, 0, rect.width, rect.height);
+
+    const allRows = calibrationRows();
+    if (!allRows.length) return;
+    const domain = calibrationPlotDomain();
+    const rows = allRows.filter(
+      (row) => row.z_ohm >= domain.start && row.z_ohm <= domain.end,
+    );
+    if (!rows.length) return;
+
+    const padding = { left: 68, right: 62, top: 26, bottom: 43 };
+    const width = Math.max(1, rect.width - padding.left - padding.right);
+    const height = Math.max(1, rect.height - padding.top - padding.bottom);
+    const leftMaximum = Math.max(
+      1,
+      Math.max(
+        ...rows.flatMap((row) => [
+          row.lockin_magnitude_count,
+          row.sine_rms_estimate_count,
+        ]),
+      ) * 1.08,
+    );
+    const phases = rows.map((row) => row.phase_atan2_degrees);
+    let phaseMinimum = Math.min(...phases);
+    let phaseMaximum = Math.max(...phases);
+    const phaseMargin = Math.max(1, (phaseMaximum - phaseMinimum) * 0.1);
+    phaseMinimum -= phaseMargin;
+    phaseMaximum += phaseMargin;
+    if (phaseMaximum === phaseMinimum) phaseMaximum += 1;
+
+    const x = (z) =>
+      padding.left + ((z - domain.start) / domain.duration) * width;
+    const yCount = (value) =>
+      padding.top + (1 - value / leftMaximum) * height;
+    const yPhase = (value) =>
+      padding.top +
+      (1 - (value - phaseMinimum) / (phaseMaximum - phaseMinimum)) * height;
+
+    context.font =
+      "10px 'JetBrains Mono', ui-monospace, SFMono-Regular, Consolas, monospace";
+    context.textBaseline = "middle";
+    for (let index = 0; index <= 5; index += 1) {
+      const gridY = padding.top + (height / 5) * index;
+      context.strokeStyle = "#3f464d";
+      context.lineWidth = 1;
+      context.beginPath();
+      context.moveTo(padding.left, gridY);
+      context.lineTo(rect.width - padding.right, gridY);
+      context.stroke();
+      context.fillStyle = "#929aa1";
+      context.textAlign = "right";
+      context.fillText(
+        formatAxis(leftMaximum * (1 - index / 5), leftMaximum),
+        padding.left - 9,
+        gridY,
+      );
+      context.textAlign = "left";
+      context.fillText(
+        `${formatNumber(phaseMaximum - ((phaseMaximum - phaseMinimum) * index) / 5, 0)}°`,
+        rect.width - padding.right + 9,
+        gridY,
+      );
+    }
+    for (let index = 0; index <= 5; index += 1) {
+      const gridX = padding.left + (width / 5) * index;
+      const z = domain.start + (domain.duration / 5) * index;
+      context.strokeStyle = "#30353a";
+      context.beginPath();
+      context.moveTo(gridX, padding.top);
+      context.lineTo(gridX, rect.height - padding.bottom);
+      context.stroke();
+      context.fillStyle = "#929aa1";
+      context.textAlign = index === 0 ? "left" : index === 5 ? "right" : "center";
+      context.fillText(
+        `${formatNumber(z, domain.duration < 20 ? 1 : 0)} Ω`,
+        gridX,
+        rect.height - 20,
+      );
+    }
+    context.fillStyle = "#929aa1";
+    context.textAlign = "left";
+    context.fillText("count", padding.left, 12);
+    context.textAlign = "right";
+    context.fillText("phase", rect.width - padding.right, 12);
+
+    calibrationTrace(
+      context,
+      rows,
+      x,
+      yCount,
+      "lockin_magnitude_count",
+      CALIBRATION_MAGNITUDE_COLOR,
+    );
+    calibrationTrace(
+      context,
+      rows,
+      x,
+      yCount,
+      "sine_rms_estimate_count",
+      CALIBRATION_RMS_COLOR,
+      true,
+    );
+    calibrationTrace(
+      context,
+      rows,
+      x,
+      yPhase,
+      "phase_atan2_degrees",
+      CALIBRATION_PHASE_COLOR,
+    );
+
+    const hover = allRows[state.calibrationHoverIndex];
+    if (hover && hover.z_ohm >= domain.start && hover.z_ohm <= domain.end) {
+      const hoverX = x(hover.z_ohm);
+      context.strokeStyle = "#c7cac5";
+      context.lineWidth = 1;
+      context.setLineDash([3, 3]);
+      context.beginPath();
+      context.moveTo(hoverX, padding.top);
+      context.lineTo(hoverX, rect.height - padding.bottom);
+      context.stroke();
+      context.setLineDash([]);
+    }
+  }
+
+  function showCalibrationTooltip(event) {
+    if (state.calibrationDrag) return;
+    const rows = calibrationRows();
+    if (!rows.length) return;
+    const rect = dom.calibrationCanvas.getBoundingClientRect();
+    const padding = { left: 68, right: 62 };
+    const width = Math.max(1, rect.width - padding.left - padding.right);
+    const fraction = Math.max(
+      0,
+      Math.min(1, (event.clientX - rect.left - padding.left) / width),
+    );
+    const domain = calibrationPlotDomain();
+    const target = domain.start + fraction * domain.duration;
+    const visible = rows.filter(
+      (row) => row.z_ohm >= domain.start && row.z_ohm <= domain.end,
+    );
+    if (!visible.length) return;
+    const candidate = visible.reduce((nearest, row) =>
+      Math.abs(row.z_ohm - target) < Math.abs(nearest.z_ohm - target)
+        ? row
+        : nearest,
+    );
+    state.calibrationHoverIndex = rows.indexOf(candidate);
+    const content = document.createDocumentFragment();
+    content.append(
+      element("strong", "calibration-tooltip-title", `z = ${formatNumber(candidate.z_ohm, 2)} Ω`),
+    );
+    [
+      ["Lock-in magnitude", candidate.lockin_magnitude_count, CALIBRATION_MAGNITUDE_COLOR, "count"],
+      ["Sine RMS estimate", candidate.sine_rms_estimate_count, CALIBRATION_RMS_COLOR, "count"],
+      ["Atan2 phase", candidate.phase_atan2_degrees, CALIBRATION_PHASE_COLOR, "°"],
+    ].forEach(([labelText, value, color, unit]) => {
+      const row = element("div", "tooltip-row");
+      const label = element("span");
+      const dot = element("i");
+      dot.style.backgroundColor = color;
+      label.append(dot, document.createTextNode(labelText));
+      row.append(
+        label,
+        element("strong", "", `${formatNumber(value, unit === "°" ? 2 : 0)} ${unit}`),
+      );
+      content.append(row);
+    });
+    dom.calibrationTooltip.replaceChildren(content);
+    dom.calibrationTooltip.hidden = false;
+    const tooltipWidth = 235;
+    const localX = event.clientX - rect.left;
+    dom.calibrationTooltip.style.left = `${Math.min(rect.width - tooltipWidth, Math.max(8, localX + 12))}px`;
+    dom.calibrationTooltip.style.top = `${Math.max(8, event.clientY - rect.top - 45)}px`;
+    scheduleDraw();
+  }
+
+  function calibrationWheel(event) {
+    if (!calibrationRows().length) return;
+    event.preventDefault();
+    const rect = dom.calibrationCanvas.getBoundingClientRect();
+    const width = Math.max(1, rect.width - 130);
+    const anchor = Math.max(
+      0,
+      Math.min(1, (event.clientX - rect.left - 68) / width),
+    );
+    setCalibrationZoom(event.deltaY > 0 ? 1.35 : 0.74, anchor);
+  }
+
+  function beginCalibrationPan(event) {
+    if (event.button !== 0 || !state.calibrationDomain) return;
+    const rect = dom.calibrationCanvas.getBoundingClientRect();
+    state.calibrationDrag = {
+      pointerId: event.pointerId,
+      lastX: event.clientX,
+      plotWidth: Math.max(1, rect.width - 130),
+    };
+    dom.calibrationCanvas.classList.add("is-dragging");
+    dom.calibrationCanvas.setPointerCapture(event.pointerId);
+    dom.calibrationTooltip.hidden = true;
+  }
+
+  function moveCalibrationPan(event) {
+    const drag = state.calibrationDrag;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    const delta = event.clientX - drag.lastX;
+    drag.lastX = event.clientX;
+    panCalibration(-delta / drag.plotWidth);
+  }
+
+  function endCalibrationPan(event) {
+    const drag = state.calibrationDrag;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    dom.calibrationCanvas.classList.remove("is-dragging");
+    if (dom.calibrationCanvas.hasPointerCapture(event.pointerId)) {
+      dom.calibrationCanvas.releasePointerCapture(event.pointerId);
+    }
+    state.calibrationDrag = null;
   }
 
   function exportCsv() {
@@ -1553,6 +2171,7 @@
       setPlotMode(dom.modeSelect.value);
     });
     dom.rangeSelect.addEventListener("change", () => {
+      resetTelemetryZoom(false);
       updateRangeOptions();
       if (state.plotMode === "history") loadHistory();
       else scheduleDraw();
@@ -1563,6 +2182,13 @@
     dom.historyTo.addEventListener("change", () => {
       if (state.plotMode === "history") loadHistory();
     });
+    dom.zoomInButton.addEventListener("click", () => {
+      setTelemetryZoom(0.5, state.plotMode === "live" ? 1 : 0.5);
+    });
+    dom.zoomOutButton.addEventListener("click", () => {
+      setTelemetryZoom(2, state.plotMode === "live" ? 1 : 0.5);
+    });
+    dom.zoomResetButton.addEventListener("click", () => resetTelemetryZoom());
     dom.pauseButton.addEventListener("click", togglePause);
     dom.exportButton.addEventListener("click", exportCsv);
     dom.variableSearch.addEventListener("input", filterVariables);
@@ -1570,6 +2196,32 @@
     dom.clearEvents.addEventListener("click", () => {
       dom.eventList.replaceChildren();
       addEvent("Session log cleared.");
+    });
+    dom.calibrationZoomIn.addEventListener("click", () => {
+      setCalibrationZoom(0.5);
+    });
+    dom.calibrationZoomOut.addEventListener("click", () => {
+      setCalibrationZoom(2);
+    });
+    dom.calibrationZoomReset.addEventListener("click", () => {
+      resetCalibrationZoom();
+    });
+    dom.calibrationCanvas.addEventListener("mousemove", showCalibrationTooltip);
+    dom.calibrationCanvas.addEventListener("mouseleave", () => {
+      if (state.calibrationDrag) return;
+      state.calibrationHoverIndex = null;
+      dom.calibrationTooltip.hidden = true;
+      scheduleDraw();
+    });
+    dom.calibrationCanvas.addEventListener("wheel", calibrationWheel, {
+      passive: false,
+    });
+    dom.calibrationCanvas.addEventListener("pointerdown", beginCalibrationPan);
+    dom.calibrationCanvas.addEventListener("pointermove", moveCalibrationPan);
+    dom.calibrationCanvas.addEventListener("pointerup", endCalibrationPan);
+    dom.calibrationCanvas.addEventListener("pointercancel", endCalibrationPan);
+    dom.calibrationCanvas.addEventListener("dblclick", () => {
+      resetCalibrationZoom();
     });
     window.addEventListener("resize", scheduleDraw);
   }
@@ -1583,6 +2235,7 @@
     try {
       await loadCatalog();
       await loadInitialState();
+      await loadCalibration();
       openStream();
     } catch (error) {
       state.streamOpen = false;
@@ -1591,6 +2244,7 @@
       dom.connectionDetail.textContent = error.message;
       addEvent(`Dashboard startup failed: ${error.message}`, "error");
     }
+    setInterval(loadCalibration, 60000);
   }
 
   start();

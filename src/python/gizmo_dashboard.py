@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import datetime as dt
 import http.client
@@ -27,6 +28,7 @@ except ModuleNotFoundError:  # Host-side pure helper tests do not need OPC UA.
 
 
 NAMESPACE_URI = "urn:fnal:gizmo"
+LEGACY_NAMESPACE_URI = "SimpleOPCUAServer"
 DEFAULT_ENDPOINT = "opc.tcp://127.0.0.1:4840"
 DEFAULT_BIND = "0.0.0.0"
 DEFAULT_PORT = 8080
@@ -34,9 +36,78 @@ DEFAULT_PUBLISH_INTERVAL = 1.0
 DEFAULT_HISTORIAN_SOCKET = "/run/gizmo/historian.sock"
 MAX_HISTORY_RESPONSE_BYTES = 32 * 1024 * 1024
 MAX_SSE_CLIENTS = 24
+MAX_CALIBRATION_ROWS = 4096
 HIGH_Z_FLOOR_OHM = float(
     os.environ.get("GIZMO_RESISTANCE_VALID_MAX_OHM", "500")
 )
+
+
+def parse_resistance_calibration(value: Any) -> dict[str, Any]:
+    """Parse the legacy four-column resistance calibration payload.
+
+    RCalData is a flattened representation of Rcalibration_ph.csv.  Its
+    magnitude column is the lock-in vector magnitude, not a statistical RMS
+    over repeated calibration reads.  For the sinusoidal calibration signal,
+    magnitude/sqrt(2) is exposed explicitly as an RMS estimate.
+    """
+
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("resistance calibration is empty")
+    fields = [field.strip() for field in value.replace("\n", ",").split(",")]
+    fields = [field for field in fields if field]
+    if not fields or len(fields) % 4:
+        raise ValueError("resistance calibration must contain four columns")
+    row_count = len(fields) // 4
+    if row_count > MAX_CALIBRATION_ROWS:
+        raise ValueError("resistance calibration exceeds the row limit")
+
+    rows: list[dict[str, float]] = []
+    for offset in range(0, len(fields), 4):
+        try:
+            z_ohm, magnitude, phase_atan, phase_atan2 = (
+                float(field) for field in fields[offset : offset + 4]
+            )
+        except ValueError as error:
+            raise ValueError(
+                f"resistance calibration row {offset // 4 + 1} is not numeric"
+            ) from error
+        if not all(
+            math.isfinite(field)
+            for field in (z_ohm, magnitude, phase_atan, phase_atan2)
+        ):
+            raise ValueError(
+                f"resistance calibration row {offset // 4 + 1} is not finite"
+            )
+        if z_ohm < 0 or magnitude < 0:
+            raise ValueError(
+                f"resistance calibration row {offset // 4 + 1} is negative"
+            )
+        rows.append(
+            {
+                "z_ohm": z_ohm,
+                "lockin_magnitude_count": magnitude,
+                "sine_rms_estimate_count": magnitude / math.sqrt(2.0),
+                "phase_atan_degrees": phase_atan,
+                "phase_atan2_degrees": phase_atan2,
+            }
+        )
+
+    return {
+        "row_count": len(rows),
+        "columns": [
+            "z_ohm",
+            "lockin_magnitude_count",
+            "sine_rms_estimate_count",
+            "phase_atan_degrees",
+            "phase_atan2_degrees",
+        ],
+        "rms_definition": "lockin_magnitude_count / sqrt(2)",
+        "rms_note": (
+            "Sinusoidal amplitude estimate in ADC-count units; raw waveform "
+            "samples are required for a statistical waveform RMS."
+        ),
+        "rows": rows,
+    }
 
 
 @dataclasses.dataclass(frozen=True)
@@ -143,6 +214,19 @@ VARIABLES: list[VariableSpec] = [
         chartable=True,
     ),
     variable(
+        "Measurement.StimulusCurrentRmsAmpere",
+        "Stimulus current RMS",
+        "Measurement",
+        "Double",
+        unit="A",
+        precision=6,
+        description=(
+            "Reserved physical monitor. Model 1.4 reports BadNotSupported and "
+            "no numeric value until its transfer function and RMS conversion "
+            "are validated."
+        ),
+    ),
+    variable(
         "Measurement.MagnitudeCount",
         "Lock-in magnitude",
         "Measurement",
@@ -225,6 +309,91 @@ VARIABLES: list[VariableSpec] = [
     ),
     variable("Alarm.Reason", "Alarm reason", "Alarm", "String"),
     variable("Alarm.LatchTime", "Latch time", "Alarm", "DateTime"),
+    variable(
+        "Operations.CommandGateState",
+        "Command gate",
+        "Operations",
+        "String",
+    ),
+    variable(
+        "Operations.LastCommandId",
+        "Last command ID",
+        "Operations",
+        "String",
+    ),
+    variable(
+        "Operations.LastCommandName",
+        "Last command",
+        "Operations",
+        "String",
+    ),
+    variable(
+        "Operations.LastCommandParameters",
+        "Command parameters",
+        "Operations",
+        "String",
+    ),
+    variable(
+        "Operations.LastCommandRequester",
+        "Command requester",
+        "Operations",
+        "String",
+    ),
+    variable(
+        "Operations.LastCommandState",
+        "Command state",
+        "Operations",
+        "String",
+    ),
+    variable(
+        "Operations.LastCommandRequestTime",
+        "Command requested",
+        "Operations",
+        "DateTime",
+    ),
+    variable(
+        "Operations.LastCommandCompletionTime",
+        "Command completed",
+        "Operations",
+        "DateTime",
+    ),
+    variable(
+        "Operations.LastCommandResult",
+        "Command result",
+        "Operations",
+        "String",
+    ),
+    variable(
+        "Calibration.OperationState",
+        "Calibration operation",
+        "Calibration",
+        "String",
+    ),
+    variable(
+        "Calibration.ProgressPercent",
+        "Calibration progress",
+        "Calibration",
+        "Double",
+        unit="%",
+    ),
+    variable(
+        "Calibration.LastOperationTime",
+        "Calibration operation time",
+        "Calibration",
+        "DateTime",
+    ),
+    variable(
+        "Calibration.LastOperationResult",
+        "Calibration operation result",
+        "Calibration",
+        "String",
+    ),
+    variable(
+        "Calibration.RestorationState",
+        "Normal-state restoration",
+        "Calibration",
+        "String",
+    ),
     variable(
         "Thermal.ChassisTemperatureCelsius",
         "Chassis temperature",
@@ -713,6 +882,7 @@ class OpcUaMonitor:
         self._subscription: Any = None
         self._nodes: list[Any] = []
         self._node_paths: dict[str, str] = {}
+        self._calibration_node_id: str | None = None
         self._values = {
             path: {
                 "value": None,
@@ -729,6 +899,14 @@ class OpcUaMonitor:
         self._last_notification: str | None = None
         self._error = "OPC UA connection has not started"
         self._sequence = 0
+        self._resistance_calibration: dict[str, Any] = {
+            "status": "BadWaitingForInitialData",
+            "source_timestamp": None,
+            "received_at": None,
+            "error": "resistance calibration has not been read",
+            "row_count": 0,
+            "rows": [],
+        }
 
     def start(self) -> None:
         if Client is None or ua is None:
@@ -750,6 +928,10 @@ class OpcUaMonitor:
         with self._lock:
             self._connected = False
             self._error = error
+            if self._resistance_calibration.get("rows"):
+                self._resistance_calibration["status"] = (
+                    "UncertainLastUsableValue"
+                )
             self._sequence += 1
 
     def _disconnect(self) -> None:
@@ -757,6 +939,7 @@ class OpcUaMonitor:
         self._subscription = None
         self._client = None
         self._nodes = []
+        self._calibration_node_id = None
         if subscription is not None:
             try:
                 subscription.delete()
@@ -774,6 +957,26 @@ class OpcUaMonitor:
         with self._lock:
             self._client = client
         namespace_index = client.get_namespace_index(NAMESPACE_URI)
+        calibration_node = None
+        try:
+            legacy_index = client.get_namespace_index(LEGACY_NAMESPACE_URI)
+            calibration_node = client.get_objects_node().get_child(
+                [
+                    f"{legacy_index}:CommandObject",
+                    f"{legacy_index}:RCalData",
+                ]
+            )
+            calibration_value = calibration_node.get_data_value()
+            self._record_resistance_calibration(
+                calibration_value.Value.Value,
+                status_name(calibration_value.StatusCode),
+                json_value(calibration_value.SourceTimestamp),
+            )
+        except Exception as error:
+            calibration_node = None
+            self._record_resistance_calibration_error(
+                f"{type(error).__name__}: {error}"
+            )
         candidate_nodes = []
         node_paths: dict[str, str] = {}
         for spec in VARIABLES:
@@ -817,6 +1020,11 @@ class OpcUaMonitor:
         with self._lock:
             self._nodes = nodes
             self._node_paths = node_paths
+            self._calibration_node_id = (
+                calibration_node.nodeid.to_string()
+                if calibration_node is not None
+                else None
+            )
         self._refresh_values(client, nodes)
 
         subscription = client.create_subscription(
@@ -832,7 +1040,10 @@ class OpcUaMonitor:
             self._error = ""
             self._sequence += 1
         try:
-            subscription.subscribe_data_change(nodes)
+            subscription_nodes = [*nodes]
+            if calibration_node is not None:
+                subscription_nodes.append(calibration_node)
+            subscription.subscribe_data_change(subscription_nodes)
         except Exception:
             with self._lock:
                 self._connected = False
@@ -869,6 +1080,42 @@ class OpcUaMonitor:
                 }
             self._sequence += 1
 
+    def _record_resistance_calibration_error(self, error: str) -> None:
+        with self._lock:
+            retained = bool(self._resistance_calibration.get("rows"))
+            self._resistance_calibration["status"] = (
+                "UncertainLastUsableValue"
+                if retained
+                else "BadDataUnavailable"
+            )
+            self._resistance_calibration["error"] = error
+            self._resistance_calibration["received_at"] = utc_now()
+
+    def _record_resistance_calibration(
+        self,
+        value: Any,
+        status: str,
+        source_timestamp: Any,
+    ) -> None:
+        received_at = utc_now()
+        try:
+            parsed = parse_resistance_calibration(value)
+        except ValueError as error:
+            self._record_resistance_calibration_error(str(error))
+            return
+        with self._lock:
+            self._resistance_calibration = {
+                **parsed,
+                "status": status,
+                "source_timestamp": source_timestamp,
+                "received_at": received_at,
+                "error": "",
+            }
+
+    def resistance_calibration(self) -> dict[str, Any]:
+        with self._lock:
+            return copy.deepcopy(self._resistance_calibration)
+
     def _run(self) -> None:
         retry_delay = 1.0
         while not self._stop.is_set():
@@ -893,7 +1140,20 @@ class OpcUaMonitor:
         value: Any,
         data_value: Any,
     ) -> None:
-        path = self._node_paths.get(node.nodeid.to_string())
+        node_id = node.nodeid.to_string()
+        if node_id == self._calibration_node_id:
+            status = "Good"
+            source_timestamp = None
+            if data_value is not None:
+                status = status_name(data_value.StatusCode)
+                source_timestamp = json_value(data_value.SourceTimestamp)
+            self._record_resistance_calibration(
+                value,
+                status,
+                source_timestamp,
+            )
+            return
+        path = self._node_paths.get(node_id)
         if path is None:
             return
         status = "Good"
@@ -1129,6 +1389,36 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._json(self._catalog())
         elif route == "/api/state":
             self._json(self.dashboard.monitor.snapshot())
+        elif route == "/api/calibration/resistance":
+            calibration_reader = getattr(
+                self.dashboard.monitor,
+                "resistance_calibration",
+                None,
+            )
+            calibration = (
+                calibration_reader()
+                if callable(calibration_reader)
+                else {
+                    "status": "BadNotSupported",
+                    "error": "resistance calibration is unavailable",
+                    "row_count": 0,
+                    "rows": [],
+                }
+            )
+            self._json(
+                {
+                    "source": (
+                        "OPC UA SimpleOPCUAServer/CommandObject/RCalData"
+                    ),
+                    "validated_max_z_ohm": HIGH_Z_FLOOR_OHM,
+                    **calibration,
+                },
+                (
+                    HTTPStatus.OK
+                    if calibration.get("rows")
+                    else HTTPStatus.SERVICE_UNAVAILABLE
+                ),
+            )
         elif route == "/api/stream":
             self._stream()
         elif route in HISTORY_ROUTES:

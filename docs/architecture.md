@@ -44,9 +44,9 @@ failure therefore cannot break the live path. See the
 [historian design](historian.md).
 
 The Kria implementation of the typed `urn:fnal:gizmo` OPC UA namespace is the
-sole authoritative GIZMo--Slow Controls machine contract. The recovered text
-and `SimpleOPCUAServer` interfaces are migration adapters. A ZedBoard server
-may implement the same contract at its own endpoint, but remains an independent
+sole authoritative GIZMo--SC/DPS machine contract. The recovered text and
+`SimpleOPCUAServer` interfaces are migration adapters. A ZedBoard server may
+implement the same contract at its own endpoint, but remains an independent
 producer: it neither proxies nor controls this Kria runtime, and its narrower
 hardware capabilities do not redefine the canonical model.
 
@@ -60,6 +60,14 @@ dedicated udev permissions.
 ZeroMQ, temperature, OPC UA, the historian, and the dashboard run as the locked
 `gizmo` system user.
 The temperature I2C node is group-owned by `gizmo`.
+
+The OPC UA session boundary permits anonymous reads but intercepts every
+remote write and method before dispatch. It accepts only stable canonical
+NodeIds, an authenticated `operator` or `maintenance` role, an enabled command
+gate, and one serialized mutation at a time. Acceptance and verified terminal
+state are separate. Audit and calibration/restoration state persist in
+`/var/lib/gizmo/opcua-command-state.json` so a server restart cannot silently
+turn an interrupted command into success.
 
 The legacy ZeroMQ server invoked arbitrary `sudo` commands and reran
 the complete startup script. The maintained server instead calls a
@@ -82,6 +90,7 @@ where the wall clock changed but the hardware RTC did not.
 | `/usr/share/gizmo/dashboard` | self-contained browser assets | package only |
 | `/lib/firmware/xilinx/GIZMo_Kria_3_7_25` | compiled overlay | package only |
 | `/etc/gizmo` | administrator configuration | dpkg conffiles |
+| `/etc/gizmo/opcua-users` | salted OPC UA control verifiers | administrator only; not package-seeded |
 | `/usr/share/gizmo/default-state` | controlled device-state bundle | package only |
 | `/var/lib/gizmo` | calibration, latch, ADC, runtime arguments | services/operator |
 | `/var/lib/gizmo/history` | retained SQLite telemetry | historian only |

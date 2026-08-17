@@ -9,8 +9,7 @@ http://<gizmo-address>:8080/
 ```
 
 For the current controls interface, use
-`http://gizmo-device.example.invalid:8080/`. The reserved name is an example;
-use the site-assigned endpoint. The dashboard is hosted by the Kria so it
+`http://<gizmo-address>:8080/`. The dashboard is hosted by the Kria so it
 continues to work on the private instrument network without a cloud service or
 an Internet route.
 
@@ -24,8 +23,11 @@ The top of the page intentionally emphasizes only the operator-critical state:
 Lower sections provide simultaneous live or persistent trends, subsystem
 quality, both PS network interfaces, owned systemd services, and a searchable
 set of typed OPC UA monitoring variables. The six standard plots share the
-same time range and synchronized cursor so impedance, thermal, lock-in, phase,
-alarm, and system behavior can be correlated without switching tabs.
+same time range, synchronized cursor, and zoom/pan viewport so impedance,
+thermal, lock-in, phase, alarm, and system behavior can be correlated without
+switching tabs. A separate installed-calibration plot reads the live
+resistance table from the board and displays lock-in magnitude, a sinusoidal
+RMS estimate, and phase as functions of impedance.
 Selecting a chartable variable in the explorer adds it as another trend. The
 advanced variable inventory is collapsed by default so the operational page
 stays compact.
@@ -96,6 +98,14 @@ Live mode retains at most one hour of samples in browser memory:
 - **Export all CSV** downloads all plotted series with UTC timestamps and an
   OPC UA status-code column for every series.
 
+The **Zoom in**, **Zoom out**, and **Reset zoom** controls apply one viewport
+to every telemetry panel. A mouse wheel zooms around the pointer, dragging a
+zoomed plot pans every panel, and double-clicking resets the viewport. These
+interactions change only the browser view; they do not change the selected
+history query or CSV export interval. The control bar reports the visible
+span. In Live mode, button zoom stays attached to the newest sample until the
+operator pans away from the live edge.
+
 History mode queries the package-owned SQLite historian and supports 1 hour,
 6 hour, 24 hour, 7 day, and custom local date/time windows. It indicates
 whether points are raw or rollups and exports the selected database interval.
@@ -113,8 +123,28 @@ When `Measurement.ResistanceRange = OutOfRange`, the impedance plot adds a
 chartreuse `HIGH Z (>500 Ω)` trace at the 500 Ω validated-range boundary.
 This is a clipped visual state, not a fabricated 500 Ω measurement:
 `ResistanceOhm` remains non-numeric with `Good` status because `HIGH Z` is a
-valid range state, and the impedance CSV exports the canonical range and its status code rather than replacing the
+valid range state, and the impedance CSV exports the canonical range and its
+status code rather than replacing the
 missing resistance value with 500.
+
+## Installed calibration plot
+
+`/api/calibration/resistance` reads the live legacy `RCalData` node through
+the dashboard's existing OPC UA session and validates the flattened
+four-column `Rcalibration_ph.csv` payload. The plot uses:
+
+- known impedance `z` in ohms;
+- lock-in vector magnitude `sqrt(I² + Q²)` in ADC-count units;
+- a sinusoidal RMS estimate, defined explicitly as `magnitude / sqrt(2)`;
+- the `atan2` phase in degrees.
+
+The RMS curve is an amplitude-derived estimate, not a statistical RMS over
+the raw ADC waveform or repeated calibration reads. Computing that quantity
+would require retaining the underlying ADC samples or one I/Q result per
+read, neither of which is present in the calibration CSV. The 1 MΩ
+open-circuit anchor is summarized separately so it does not compress the
+validated 0–500 Ω response. The calibration plot has independent wheel,
+button, drag, and double-click zoom controls.
 
 ## Read-only HTTP interface
 
@@ -126,6 +156,7 @@ The same-origin browser API is deliberately small:
 | `/api/catalog` | monitored variable metadata and chart presets |
 | `/api/state` | latest cached values and connection state |
 | `/api/stream` | one-second server-sent-event stream |
+| `/api/calibration/resistance` | validated live resistance calibration rows, RMS estimate, and phase |
 | `/api/history/status` | historian connection, storage, and time bounds |
 | `/api/history/series` | retained-series metadata |
 | `/api/history/query` | bounded raw or rollup query |

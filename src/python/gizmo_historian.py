@@ -50,6 +50,7 @@ DEFAULT_REPLICA_POLL_SECONDS = 2.0
 DEFAULT_REPLICA_BATCH_SIZE = 1000
 MAX_REPLICA_BATCH_SIZE = 2000
 MAX_REPLICA_RESPONSE_BYTES = 8 * 1024**2
+STATUS_AVERAGE_SAMPLE_ROWS = 4096
 REPLICATION_TABLES = (
     "fast_sample",
     "platform_sample",
@@ -109,6 +110,7 @@ PLATFORM_CAPTURE_PATHS = PLATFORM_QUERY_PATHS
 EVENT_PATHS = (
     "Identity.RuntimeVersion",
     "Identity.BootId",
+    "Measurement.StimulusCurrentRmsAmpere",
     "Measurement.ResistanceRange",
     "Measurement.CapacitanceRange",
     "Measurement.Quality",
@@ -116,6 +118,20 @@ EVENT_PATHS = (
     "Alarm.Latched",
     "Alarm.Reason",
     "Alarm.LatchTime",
+    "Operations.CommandGateState",
+    "Operations.LastCommandId",
+    "Operations.LastCommandName",
+    "Operations.LastCommandParameters",
+    "Operations.LastCommandRequester",
+    "Operations.LastCommandState",
+    "Operations.LastCommandRequestTime",
+    "Operations.LastCommandCompletionTime",
+    "Operations.LastCommandResult",
+    "Calibration.OperationState",
+    "Calibration.ProgressPercent",
+    "Calibration.LastOperationTime",
+    "Calibration.LastOperationResult",
+    "Calibration.RestorationState",
     "Health.Overall",
     "Health.Measurement",
     "Health.Thermal",
@@ -450,10 +466,16 @@ class HistorianStore:
                 payload BLOB NOT NULL
             ) WITHOUT ROWID;
 
+            CREATE INDEX IF NOT EXISTS fast_sample_status_scan
+                ON fast_sample(receive_time_us);
+
             CREATE TABLE IF NOT EXISTS platform_sample (
                 receive_time_us INTEGER PRIMARY KEY,
                 payload BLOB NOT NULL
             ) WITHOUT ROWID;
+
+            CREATE INDEX IF NOT EXISTS platform_sample_status_scan
+                ON platform_sample(receive_time_us);
 
             CREATE TABLE IF NOT EXISTS minute_rollup (
                 bucket_us INTEGER PRIMARY KEY,
@@ -461,6 +483,9 @@ class HistorianStore:
                 payload BLOB NOT NULL,
                 updated_us INTEGER NOT NULL
             ) WITHOUT ROWID;
+
+            CREATE INDEX IF NOT EXISTS minute_rollup_status_scan
+                ON minute_rollup(bucket_us);
 
             CREATE TABLE IF NOT EXISTS event (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1575,21 +1600,51 @@ class HistorianStore:
             fast = connection.execute(
                 """
                 SELECT COUNT(*) AS count, MIN(receive_time_us) AS oldest,
-                       MAX(receive_time_us) AS newest, AVG(LENGTH(payload)) AS average
-                FROM fast_sample
+                       MAX(receive_time_us) AS newest
+                FROM fast_sample INDEXED BY fast_sample_status_scan
                 """
+            ).fetchone()
+            fast_average = connection.execute(
+                """
+                SELECT AVG(LENGTH(payload)) AS average, COUNT(*) AS sampled
+                FROM (
+                    SELECT payload FROM fast_sample
+                    ORDER BY receive_time_us DESC LIMIT ?
+                )
+                """,
+                (STATUS_AVERAGE_SAMPLE_ROWS,),
             ).fetchone()
             platform = connection.execute(
                 """
-                SELECT COUNT(*) AS count, AVG(LENGTH(payload)) AS average
-                FROM platform_sample
+                SELECT COUNT(*) AS count
+                FROM platform_sample INDEXED BY platform_sample_status_scan
                 """
+            ).fetchone()
+            platform_average = connection.execute(
+                """
+                SELECT AVG(LENGTH(payload)) AS average, COUNT(*) AS sampled
+                FROM (
+                    SELECT payload FROM platform_sample
+                    ORDER BY receive_time_us DESC LIMIT ?
+                )
+                """,
+                (STATUS_AVERAGE_SAMPLE_ROWS,),
             ).fetchone()
             rollup = connection.execute(
                 """
-                SELECT COUNT(*) AS count, AVG(LENGTH(payload)) AS average
-                FROM minute_rollup
+                SELECT COUNT(*) AS count
+                FROM minute_rollup INDEXED BY minute_rollup_status_scan
                 """
+            ).fetchone()
+            rollup_average = connection.execute(
+                """
+                SELECT AVG(LENGTH(payload)) AS average, COUNT(*) AS sampled
+                FROM (
+                    SELECT payload FROM minute_rollup
+                    ORDER BY bucket_us DESC LIMIT ?
+                )
+                """,
+                (STATUS_AVERAGE_SAMPLE_ROWS,),
             ).fetchone()
             event_count = connection.execute(
                 "SELECT COUNT(*) FROM event"
@@ -1614,9 +1669,9 @@ class HistorianStore:
         total_bytes = sum(sizes.values())
         active_bytes = max(0, (page_count - freelist) * page_size) + sizes["wal"]
         estimate = self.estimate_monthly_bytes(
-            fast_payload_bytes=fast["average"] or 0,
-            platform_payload_bytes=platform["average"] or 0,
-            rollup_payload_bytes=rollup["average"] or 0,
+            fast_payload_bytes=fast_average["average"] or 0,
+            platform_payload_bytes=platform_average["average"] or 0,
+            rollup_payload_bytes=rollup_average["average"] or 0,
         )
         return {
             "database": str(self.database),
@@ -1626,15 +1681,18 @@ class HistorianStore:
                 "count": fast["count"],
                 "oldest": iso_from_us(fast["oldest"]),
                 "newest": iso_from_us(fast["newest"]),
-                "average_payload_bytes": fast["average"],
+                "average_payload_bytes": fast_average["average"],
+                "average_payload_sample_rows": fast_average["sampled"],
             },
             "platform_samples": {
                 "count": platform["count"],
-                "average_payload_bytes": platform["average"],
+                "average_payload_bytes": platform_average["average"],
+                "average_payload_sample_rows": platform_average["sampled"],
             },
             "minute_rollups": {
                 "count": rollup["count"],
-                "average_payload_bytes": rollup["average"],
+                "average_payload_bytes": rollup_average["average"],
+                "average_payload_sample_rows": rollup_average["sampled"],
             },
             "events": {"count": event_count},
             "replication": [

@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+"""Provision GIZMo OPC UA control identities without exposing passwords."""
+
+from __future__ import annotations
+
+import argparse
+import getpass
+import grp
+import os
+import stat
+import sys
+import tempfile
+from pathlib import Path
+
+_BUNDLED_PYTHON = Path("/usr/lib/gizmo/python")
+_GIZMO_PYTHON = Path("/usr/libexec/gizmo")
+for _path in (_BUNDLED_PYTHON, _GIZMO_PYTHON):
+    if _path.is_dir():
+        sys.path.insert(0, str(_path))
+
+from gizmo_security import CredentialStore, credential_line, validate_identity
+
+
+DEFAULT_FILE = Path(
+    os.environ.get("GIZMO_OPCUA_CREDENTIAL_FILE", "/etc/gizmo/opcua-users")
+)
+
+
+def credential_records(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    status = path.lstat()
+    if not stat.S_ISREG(status.st_mode) or path.is_symlink():
+        raise RuntimeError(f"credential path is not a regular file: {path}")
+    CredentialStore.load(path)
+    result: dict[str, str] = {}
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        text = raw.strip()
+        if not text or text.startswith("#"):
+            continue
+        result[text.split(":", 1)[0]] = text
+    return result
+
+
+def write_records(path: Path, records: dict[str, str]) -> None:
+    path.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    gizmo_gid = grp.getgrnam("gizmo").gr_gid
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write("# username:role:scheme:iterations:salt:digest\n")
+            for username in sorted(records):
+                stream.write(records[username] + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+            os.fchmod(stream.fileno(), 0o640)
+            os.fchown(stream.fileno(), 0, gizmo_gid)
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Manage the package-owned GIZMo OPC UA credential file"
+    )
+    parser.add_argument("--file", type=Path, default=DEFAULT_FILE)
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("list", help="list usernames and roles (never passwords)")
+    set_user = commands.add_parser("set", help="add or replace one identity")
+    set_user.add_argument("username")
+    set_user.add_argument("role", choices=("operator", "maintenance"))
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    if os.geteuid() != 0:
+        raise SystemExit("gizmo-opcua-user must run as root")
+    records = credential_records(args.file)
+    if args.command == "list":
+        for username in sorted(records):
+            fields = records[username].split(":")
+            print(f"{fields[0]}\t{fields[1]}")
+        return 0
+
+    validate_identity(args.username, args.role)
+    password = getpass.getpass(f"Password for {args.username}: ")
+    confirmation = getpass.getpass("Repeat password: ")
+    if password != confirmation:
+        raise SystemExit("passwords do not match")
+    records[args.username] = credential_line(
+        args.username,
+        args.role,
+        password,
+    )
+    write_records(args.file, records)
+    print(
+        f"updated {args.username} ({args.role}) in {args.file}; "
+        "restart gizmo-opcua.service only after reviewing the command gate"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

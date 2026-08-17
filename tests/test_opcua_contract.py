@@ -24,10 +24,10 @@ class OpcUaContractTests(unittest.TestCase):
             self.contract["authority"], "GIZMo Kria OPC UA implementation"
         )
         self.assertEqual(self.contract["namespace_uri"], "urn:fnal:gizmo")
-        self.assertEqual(self.contract["model_version"], "1.3.1")
+        self.assertEqual(self.contract["model_version"], "1.4.0")
         self.assertEqual(len(self.contract["objects"]), 43)
-        self.assertEqual(len(self.contract["variables"]), 457)
-        self.assertEqual(len(self.contract["methods"]), 5)
+        self.assertEqual(len(self.contract["variables"]), 472)
+        self.assertEqual(len(self.contract["methods"]), 8)
 
     def test_embedded_digest_covers_the_canonical_contract(self) -> None:
         unsigned = dict(self.contract)

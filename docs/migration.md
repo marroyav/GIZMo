@@ -19,7 +19,7 @@ Copy the backup off the instrument.
 ## 2. Install without activating
 
 ```sh
-sudo dpkg -i gizmo-runtime_0.4.3_arm64.deb
+sudo dpkg -i --force-confold gizmo-runtime_0.5.1_arm64.deb
 sudo gizmo-doctor
 ```
 
@@ -109,6 +109,13 @@ Use `journalctl -u 'gizmo-*' -b` for diagnostics.
 
 Do not run calibration as an initial smoke test; it moves relays, rewrites
 device-specific tables, and takes several minutes.
+
+For an in-place package upgrade, preserve all three `/etc/gizmo` conffiles and
+record their checksums first. Runtime 0.5.0 and later leave the network service
+and FPGA overlay in place during upgrades and restart only running user-space
+components. Do not reboot or restart `gizmo-network.service` as part of a
+remote smoke test. Keep a second authenticated shell and an independent TCP/22
+reachability monitor open until OPC UA and the dashboard have recovered.
 
 ## Rollback
 

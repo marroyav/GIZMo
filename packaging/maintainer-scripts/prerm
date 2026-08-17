@@ -4,7 +4,10 @@ set -eu
 if [ -d /run/systemd/system ] && systemctl is-active --quiet gizmo.target; then
     if [ "${1:-}" = upgrade ]; then
         mkdir -p /run/gizmo
-        touch /run/gizmo/restart-after-upgrade
+        # Keep the network addresses and FPGA overlay in place.  The new
+        # postinst restarts only running user-space components after unpack.
+        touch /run/gizmo/restart-services-after-upgrade
+    else
+        systemctl stop gizmo.target
     fi
-    systemctl stop gizmo.target
 fi

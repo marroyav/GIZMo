@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the authoritative GIZMo--SC OPC UA contract from the Kria model."""
+"""Generate the authoritative GIZMo--SC/DPS OPC UA contract from the Kria model."""
 
 from __future__ import annotations
 
@@ -41,7 +41,7 @@ def argument_contract(argument: object) -> dict[str, Any]:
 def render_contract(repo_root: Path) -> dict[str, Any]:
     sys.path.insert(0, str(repo_root / "src" / "python"))
     os.environ.setdefault("GIZMO_OPCUA_ENDPOINT", "opc.tcp://127.0.0.1:48887")
-    # Generation only constructs the in-process address space. A loopback,
+    # Generation only constructs the in-process address space.  A loopback,
     # non-started server needs no site certificate and must not depend on one.
     os.environ.setdefault("GIZMO_OPCUA_ALLOW_INSECURE", "1")
 
